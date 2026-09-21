@@ -1,0 +1,21 @@
+name: Jules Router
+
+on:
+  issues:
+    types: [opened, edited, labeled, reopened]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  jules:
+    uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
+    with:
+      home: a
+      overflow: b
+      max_rounds: 2
+      auto_review_prs: false
+    secrets:
+      jules_a_api_key: ${{ secrets.JULES_A_API_KEY }}
+      jules_b_api_key: ${{ secrets.JULES_B_API_KEY }}
