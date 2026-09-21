@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-agent-router"
+version = "0.1.0"
+description = "Sticky GitHub-to-Jules account/session router"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+github-agent-router = "github_agent_router.router:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
