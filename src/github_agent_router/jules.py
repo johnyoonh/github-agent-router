@@ -92,3 +92,18 @@ class JulesClient:
             f"/sessions/{parse.quote(session_id)}:sendMessage",
             {"prompt": prompt},
         )
+
+    def list_activities(self, session_name: str) -> list[dict[str, Any]]:
+        session_id = session_name.rsplit("/", 1)[-1]
+        activities: list[dict[str, Any]] = []
+        token = ""
+        while True:
+            query = "?pageSize=100"
+            if token:
+                query += "&pageToken=" + parse.quote(token)
+            data = self._request("GET", f"/sessions/{parse.quote(session_id)}/activities{query}")
+            activities.extend(data.get("activities", []))
+            token = data.get("nextPageToken", "")
+            if not token:
+                return activities
+

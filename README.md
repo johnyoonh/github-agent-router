@@ -80,9 +80,18 @@ JULES_A_API_KEY
 JULES_B_API_KEY
 ```
 
-Do not commit either key to this repository, dotfiles, or the wiki.
+Do not commit either key to this repository, dotfiles, or the wiki. Store them securely (e.g. in Bitwarden via `bwa set JULES_A_API_KEY`).
+
+You can verify your configured keys at any time:
+
+```bash
+JULES_A_API_KEY="$(bwa get JulesA JULES_A_API_KEY)" \
+JULES_B_API_KEY="$(bwa get JulesB JULES_B_API_KEY)" \
+github-agent-router check
+```
 
 ### 2. Give both Jules accounts repository access
+
 
 For every target repository, install/authorize the Jules GitHub integration from each Jules account that may receive that repository.
 
@@ -138,17 +147,30 @@ jules:needs-user
 agent:jules
 ```
 
-The router can create missing owner/state labels after it starts, but `jules:run` must exist before you can manually apply it in GitHub.
+You can automate label creation with the CLI:
+
+```bash
+GITHUB_TOKEN=... github-agent-router setup-labels <owner/repo> [repo2...]
+```
+
+Even better, you can provision both the labels **and** the workflow file in one command:
+
+```bash
+GITHUB_TOKEN=... github-agent-router provision <owner/repo> [repo2...]
+```
+
+The router also automatically ensures all 5 labels exist on any repository whenever it persists an issue or PR session.
 
 ### 6. Add the target workflow
 
-Copy [`examples/target-router.yml`](examples/target-router.yml) to:
+If not using `github-agent-router provision`, copy [`examples/target-router.yml`](examples/target-router.yml) to:
 
 ```text
 .github/workflows/jules-router.yml
 ```
 
 in each target repository.
+
 
 Example:
 

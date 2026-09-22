@@ -15,7 +15,7 @@ from .jules import JulesClient, JulesError
 MARKER_PREFIX = "<!-- github-agent-router:"
 MARKER_RE = re.compile(r"<!-- github-agent-router:(\{.*?\}) -->", re.DOTALL)
 ACTIVE_STATES = {"QUEUED", "PLANNING", "AWAITING_PLAN_APPROVAL", "IN_PROGRESS", "PAUSED"}
-TERMINAL_STATES = {"COMPLETED", "FAILED"}
+TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "CANCELED"}
 
 
 @dataclass
@@ -36,7 +36,7 @@ class RouteState:
         }
         lines = [
             f"Jules owner: **{self.owner.upper()}**",
-            f"Session: \`{self.session}\`",
+            f"Session: `{self.session}`",
             f"Round: **{self.round}**",
         ]
         if self.url:
@@ -44,6 +44,7 @@ class RouteState:
         if self.state:
             lines.append(f"State: **{self.state}**")
         return f"{MARKER_PREFIX}{json.dumps(meta, separators=(',', ':'))} -->\n\n" + "  \n".join(lines)
+
 
 
 def label_names(obj: dict[str, Any]) -> set[str]:
@@ -98,7 +99,7 @@ def should_route_pr(pr: dict[str, Any], config: Config) -> bool:
     head = str((pr.get("head") or {}).get("ref", ""))
     if "agent:jules" in labels or head.startswith(("jules/", "jules-", "google-jules/")):
         return False
-    return config.auto_review_prs or "jules:run" in labels
+    return config.auto_review_prs or "jules:run" in labels or bool(owner_from_labels(labels))
 
 
 def build_prompt(payload: dict[str, Any]) -> tuple[str, str, str, int, set[str]]:
@@ -149,6 +150,7 @@ def event_message(event_name: str, payload: dict[str, Any]) -> str:
 
 
 def persist(gh: GitHubClient, number: int, state: RouteState) -> None:
+    gh.setup_labels()
     gh.add_labels(number, [f"jules-owner:{state.owner}"])
     other = "b" if state.owner == "a" else "a"
     gh.remove_label(number, f"jules-owner:{other}")
@@ -192,14 +194,14 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
         issue = payload.get("issue") or {}
         number = int(issue["number"])
         message = event_message(event_name, payload)
-        if not message.startswith("/jules"):
+        if not re.match(r"^/jules(?:\s*:\s*|\s+|$)", message):
             return "ignored issue comment without /jules"
         state, _ = parse_route_state(gh.comments(number))
         if not state:
             return "ignored /jules comment because no routed session exists"
         if not config.jules_keys.get(state.owner):
             raise ValueError(f"missing API key for sticky owner {state.owner}")
-        prompt = message[len("/jules"):].strip()
+        prompt = re.sub(r"^/jules(?:\s*:\s*|\s+)?", "", message).strip()
         if not prompt:
             return "ignored empty /jules command"
         JulesClient(config.jules_keys[state.owner]).send_message(state.session, prompt)
@@ -211,7 +213,7 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
     if "pull_request" in payload and not should_route_pr(payload["pull_request"], config):
         return "ignored PR: auto review disabled and jules:run absent"
 
-    if "pull_request" not in payload and "jules:run" not in labels:
+    if "pull_request" not in payload and "jules:run" not in labels and not owner_from_labels(labels):
         return "ignored issue: jules:run absent"
 
     state, _ = parse_route_state(gh.comments(number))
@@ -231,11 +233,6 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
             persist(gh, number, state)
             return f"{state.session} awaits user feedback"
 
-        if session_state in ACTIVE_STATES:
-            client.send_message(state.session, event_message(event_name, payload))
-            persist(gh, number, state)
-            return f"continued active sticky session {state.session}"
-
         if session_state in TERMINAL_STATES:
             if state.round >= config.max_rounds:
                 gh.add_labels(number, ["jules:needs-user"])
@@ -252,6 +249,11 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
             )
             persist(gh, number, next_state)
             return f"created sticky follow-up {next_state.session}"
+
+        # Otherwise continue active session (ACTIVE_STATES or other non-terminal states)
+        client.send_message(state.session, event_message(event_name, payload))
+        persist(gh, number, state)
+        return f"continued active sticky session {state.session}"
 
     owner = sticky_owner or choose_owner(labels, config)
     if config.dry_run:
@@ -300,14 +302,160 @@ def load_event() -> tuple[str, dict[str, Any]]:
         return event_name, json.load(fh)
 
 
-def main() -> None:
+def check_credentials(config: Config) -> int:
+    """Verify configured Jules API keys and GitHub token."""
+    print("Checking configured credentials...")
+    ok = True
+    for owner in ("a", "b"):
+        key = config.jules_keys.get(owner, "")
+        if not key:
+            print(f"  [Jules {owner.upper()}] Not configured (JULES_{owner.upper()}_API_KEY is empty)")
+            continue
+        try:
+            client = JulesClient(key)
+            sources = client.list_sources()
+            names = [
+                f"{s.get('githubRepo', {}).get('owner', '')}/{s.get('githubRepo', {}).get('repo', '')}"
+                for s in sources
+                if s.get("githubRepo")
+            ]
+            sample = f" (repos: {', '.join(names[:3])}{'...' if len(names) > 3 else ''})" if names else ""
+            print(f"  [Jules {owner.upper()}] OK - {len(sources)} source(s) accessible{sample}")
+        except Exception as exc:
+            print(f"  [Jules {owner.upper()}] Error: {exc}")
+            ok = False
+
+    if config.github_token:
+        print("  [GitHub] GITHUB_TOKEN is set")
+    else:
+        print("  [GitHub] GITHUB_TOKEN is not set")
+    return 0 if ok else 1
+
+
+def setup_repo_labels(config: Config, repo_full_name: str) -> None:
+    """Ensure standard router labels exist on the specified repository."""
+    if not config.github_token:
+        raise ValueError("GITHUB_TOKEN is required to setup labels")
+    gh = GitHubClient(config.github_token, repo_full_name)
+    ensured = gh.setup_labels()
+    print(f"Successfully ensured {len(ensured)} labels on {repo_full_name}: {', '.join(ensured)}")
+
+
+def generate_workflow_content(
+    home: str = "a",
+    overflow: str = "b",
+    max_rounds: int = 2,
+    auto_review_prs: bool = False,
+) -> str:
+    overflow_val = f'"{overflow}"' if overflow else '""'
+    auto_review_val = "true" if auto_review_prs else "false"
+    return f"""name: Jules Router
+
+on:
+  issues:
+    types: [opened, edited, labeled, reopened]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  issue_comment:
+    types: [created]
+
+jobs:
+  jules:
+    uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
+    with:
+      home: {home}
+      overflow: {overflow_val}
+      max_rounds: {max_rounds}
+      auto_review_prs: {auto_review_val}
+    secrets:
+      jules_a_api_key: ${{{{ secrets.JULES_A_API_KEY }}}}
+      jules_b_api_key: ${{{{ secrets.JULES_B_API_KEY }}}}
+"""
+
+
+def provision_repo(
+    config: Config,
+    repo_full_name: str,
+    home: str = "a",
+    overflow: str = "b",
+    max_rounds: int = 2,
+    auto_review_prs: bool = False,
+    branch: str | None = None,
+) -> None:
+    """Provisions a target repository on GitHub: ensures labels and commits workflow."""
+    if not config.github_token:
+        raise ValueError("GITHUB_TOKEN is required to provision repository")
+    gh = GitHubClient(config.github_token, repo_full_name)
+    print(f"Provisioning {repo_full_name}...")
+    ensured = gh.setup_labels()
+    print(f"  [Labels] Ensured {len(ensured)} labels: {', '.join(ensured)}")
+
+    workflow_content = generate_workflow_content(home, overflow, max_rounds, auto_review_prs)
+    workflow_path = ".github/workflows/jules-router.yml"
+    gh.put_file(
+        path=workflow_path,
+        content=workflow_content,
+        message="ci: add Jules router workflow",
+        branch=branch,
+    )
+    print(f"  [Workflow] Created/updated {workflow_path}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    config = Config.from_env()
+
+    if args and args[0] in ("--help", "-h", "help"):
+        print("Usage:")
+        print("  github-agent-router                                Route GitHub event from environment")
+        print("  github-agent-router check                          Verify Jules API keys and GitHub token")
+        print("  github-agent-router setup-labels <repo> [repo2...] Ensure required labels exist on repo(s)")
+        print("  github-agent-router provision <repo> [repo2...]    Ensure labels and install jules-router.yml")
+        return
+
+    if args and args[0] == "check":
+        sys.exit(check_credentials(config))
+
+    if args and args[0] == "setup-labels":
+        repos = args[1:]
+        if not repos:
+            repo = os.getenv("GITHUB_REPOSITORY", "")
+            if not repo:
+                print("Usage: github-agent-router setup-labels <owner/repo> [repo2...]", file=sys.stderr)
+                sys.exit(1)
+            repos = [repo]
+        for r in repos:
+            setup_repo_labels(config, r)
+        return
+
+    if args and args[0] == "provision":
+        repos = args[1:]
+        if not repos:
+            repo = os.getenv("GITHUB_REPOSITORY", "")
+            if not repo:
+                print("Usage: github-agent-router provision <owner/repo> [repo2...]", file=sys.stderr)
+                sys.exit(1)
+            repos = [repo]
+        for r in repos:
+            provision_repo(
+                config,
+                r,
+                home=config.home,
+                overflow=config.overflow or "",
+                max_rounds=config.max_rounds,
+                auto_review_prs=config.auto_review_prs,
+            )
+        return
+
     try:
         event_name, payload = load_event()
-        print(route(Config.from_env(), event_name, payload))
+        print(route(config, event_name, payload))
     except Exception as exc:
         print(f"github-agent-router: {exc}", file=sys.stderr)
         raise
 
 
+
 if __name__ == "__main__":
     main()
+

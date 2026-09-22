@@ -1,19 +1,35 @@
+import json
+import sys
+from pathlib import Path
 import unittest
+from unittest.mock import MagicMock, patch
+
+ROOT = Path(__file__).resolve().parent.parent / "src"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from github_agent_router.config import Config
+
+from github_agent_router.github import GitHubClient, REQUIRED_LABELS
+from github_agent_router.jules import JulesClient, JulesError
 from github_agent_router.router import (
     RouteState,
+    build_prompt,
+    check_credentials,
     choose_owner,
+    event_message,
     owner_from_labels,
     parse_route_state,
+    route,
+    setup_repo_labels,
     should_route_pr,
 )
 
 
 def cfg(**kwargs):
     base = dict(
-        github_token="x",
-        jules_keys={"a": "A", "b": "B"},
+        github_token="gh-test-token",
+        jules_keys={"a": "key-a", "b": "key-b"},
         home="a",
         overflow="b",
         max_rounds=2,
@@ -24,23 +40,37 @@ def cfg(**kwargs):
     return Config(**base)
 
 
-class RouterTests(unittest.TestCase):
+class RouterUnitTests(unittest.TestCase):
     def test_sticky_owner_beats_home(self):
         self.assertEqual(choose_owner({"jules-owner:b"}, cfg(home="a")), "b")
+        self.assertEqual(choose_owner({"jules-owner:a"}, cfg(home="b")), "a")
 
     def test_home_used_for_unclaimed_work(self):
         self.assertEqual(choose_owner(set(), cfg(home="a")), "a")
+        self.assertEqual(choose_owner(set(), cfg(home="b")), "b")
 
     def test_missing_home_key_uses_overflow(self):
-        self.assertEqual(choose_owner(set(), cfg(jules_keys={"a": "", "b": "B"})), "b")
+        self.assertEqual(choose_owner(set(), cfg(jules_keys={"a": "", "b": "key-b"})), "b")
+
+    def test_no_keys_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            choose_owner(set(), cfg(jules_keys={"a": "", "b": ""}))
+
+    def test_unknown_home_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            choose_owner(set(), cfg(home="c"))
 
     def test_owner_labels(self):
         self.assertEqual(owner_from_labels({"bug", "jules-owner:a"}), "a")
+        self.assertEqual(owner_from_labels({"jules-owner:b"}), "b")
         self.assertIsNone(owner_from_labels({"bug"}))
 
     def test_marker_round_trip(self):
         state = RouteState("a", "sessions/123", "https://jules.google/x", 2, "IN_PROGRESS")
-        parsed, comment_id = parse_route_state([{"id": 9, "body": state.comment()}])
+        comment_body = state.comment()
+        self.assertNotIn(r"\`", comment_body)
+        self.assertIn("`sessions/123`", comment_body)
+        parsed, comment_id = parse_route_state([{"id": 9, "body": comment_body}])
         self.assertEqual(comment_id, 9)
         self.assertEqual(parsed, state)
 
@@ -52,10 +82,308 @@ class RouterTests(unittest.TestCase):
         pr = {"labels": [], "head": {"ref": "chatgpt/feature"}}
         self.assertTrue(should_route_pr(pr, cfg(auto_review_prs=True)))
 
+    def test_pr_with_jules_run_label(self):
+        pr = {"labels": [{"name": "jules:run"}], "head": {"ref": "chatgpt/feature"}}
+        self.assertTrue(should_route_pr(pr, cfg(auto_review_prs=False)))
+
+    def test_pr_sticky_owner_allows_continuation(self):
+        pr = {"labels": [{"name": "jules-owner:a"}], "head": {"ref": "chatgpt/feature"}}
+        self.assertTrue(should_route_pr(pr, cfg(auto_review_prs=False)))
+
     def test_jules_pr_is_not_re_reviewed(self):
         pr = {"labels": [{"name": "agent:jules"}], "head": {"ref": "jules/fix"}}
         self.assertFalse(should_route_pr(pr, cfg(auto_review_prs=True)))
+        pr_branch = {"labels": [], "head": {"ref": "google-jules/fix"}}
+        self.assertFalse(should_route_pr(pr_branch, cfg(auto_review_prs=True)))
+
+    def test_build_prompt_issue(self):
+        payload = {
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "issue": {"number": 42, "title": "Fix bug", "body": "Details here", "labels": []},
+        }
+        title, prompt, branch, number, labels = build_prompt(payload)
+        self.assertEqual(number, 42)
+        self.assertEqual(branch, "main")
+        self.assertIn("Fix bug", title)
+        self.assertIn("Details here", prompt)
+
+    def test_build_prompt_pr(self):
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "pull_request": {
+                "number": 10,
+                "title": "Add feature",
+                "body": "PR description",
+                "head": {"ref": "feat-branch"},
+                "labels": [{"name": "jules:run"}],
+            },
+        }
+        title, prompt, branch, number, labels = build_prompt(payload)
+        self.assertEqual(number, 10)
+        self.assertEqual(branch, "feat-branch")
+        self.assertIn("Review PR #10", title)
+        self.assertIn("PR description", prompt)
+        self.assertIn("jules:run", labels)
+
+    def test_event_message(self):
+        self.assertEqual(
+            event_message("issue_comment", {"comment": {"body": "hello"}}),
+            "hello",
+        )
+        self.assertIn(
+            "abc1234",
+            event_message("pull_request", {"pull_request": {"head": {"sha": "abc1234"}}}),
+        )
+        self.assertIn(
+            "requirements",
+            event_message("issues", {"issue": {"number": 1}}),
+        )
+
+
+class RouteFlowTests(unittest.TestCase):
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_unlabeled_issue_ignored(self, mock_jules, mock_gh):
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1, "title": "Test", "labels": []},
+        }
+        result = route(cfg(), "issues", payload)
+        self.assertIn("ignored issue: jules:run absent", result)
+        mock_jules.return_value.create_session.assert_not_called()
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_labeled_issue_creates_session(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        mock_gh.comments.return_value = []
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.find_source.return_value = "sources/123"
+        mock_jules.create_session.return_value = {
+            "name": "sessions/s1",
+            "url": "https://jules.google/s1",
+            "state": "IN_PROGRESS",
+        }
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
+        }
+        result = route(cfg(), "issues", payload)
+        self.assertIn("created sessions/s1 on Jules a", result)
+        mock_gh.add_labels.assert_called_with(1, ["jules-owner:a"])
+        mock_gh.upsert_router_comment.assert_called()
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_overflow_on_429(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        mock_gh.comments.return_value = []
+
+        def client_side_effect(api_key):
+            client = MagicMock()
+            if api_key == "key-a":
+                client.find_source.side_effect = JulesError(429, "rate limited")
+            else:
+                client.find_source.return_value = "sources/b123"
+                client.create_session.return_value = {
+                    "name": "sessions/overflow-b",
+                    "url": "https://jules.google/overflow-b",
+                    "state": "IN_PROGRESS",
+                }
+            return client
+
+        mock_jules_cls.side_effect = client_side_effect
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
+        }
+        result = route(cfg(home="a", overflow="b"), "issues", payload)
+        self.assertIn("created sessions/overflow-b on Jules b", result)
+        mock_gh.add_labels.assert_called_with(1, ["jules-owner:b"])
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_active_session_continuation(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
+        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.get_session.return_value = {"state": "IN_PROGRESS", "url": "https://jules.google/s1"}
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
+        }
+        result = route(cfg(), "issues", payload)
+        self.assertIn("continued active sticky session sessions/s1", result)
+        mock_jules.send_message.assert_called()
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_awaiting_user_feedback(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
+        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.get_session.return_value = {"state": "AWAITING_USER_FEEDBACK", "url": "https://jules.google/s1"}
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
+        }
+        result = route(cfg(), "issues", payload)
+        self.assertIn("awaits user feedback", result)
+        mock_gh.add_labels.assert_any_call(1, ["jules:needs-user"])
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_terminal_creates_next_round(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "COMPLETED")
+        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.get_session.return_value = {"state": "COMPLETED", "url": "https://jules.google/s1"}
+        mock_jules.find_source.return_value = "sources/123"
+        mock_jules.create_session.return_value = {
+            "name": "sessions/s2",
+            "url": "https://jules.google/s2",
+            "state": "IN_PROGRESS",
+        }
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "pull_request": {
+                "number": 5,
+                "title": "PR 5",
+                "head": {"ref": "fix-1"},
+                "labels": [{"name": "jules:run"}],
+            },
+        }
+        result = route(cfg(max_rounds=2), "pull_request", payload)
+        self.assertIn("created sticky follow-up sessions/s2", result)
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_terminal_max_rounds_adds_needs_user(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        existing_state = RouteState("a", "sessions/s2", "https://jules.google/s2", 2, "COMPLETED")
+        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.get_session.return_value = {"state": "COMPLETED", "url": "https://jules.google/s2"}
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "pull_request": {
+                "number": 5,
+                "title": "PR 5",
+                "head": {"ref": "fix-1"},
+                "labels": [{"name": "jules:run"}],
+            },
+        }
+        result = route(cfg(max_rounds=2), "pull_request", payload)
+        self.assertIn("stopped at max Jules rounds (2)", result)
+        mock_gh.add_labels.assert_any_call(5, ["jules:needs-user"])
+
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_issue_comment_routes_jules_prompt(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
+        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_jules = mock_jules_cls.return_value
+
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1},
+            "comment": {"body": "/jules: please retain user logs"},
+        }
+        result = route(cfg(), "issue_comment", payload)
+        self.assertIn("sent message to sessions/s1", result)
+        mock_jules.send_message.assert_called_with("sessions/s1", "please retain user logs")
+        mock_gh.remove_label.assert_called_with(1, "jules:needs-user")
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_issue_comment_empty_or_ignored(self, mock_jules_cls, mock_gh_cls):
+        payload_non_jules = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1},
+            "comment": {"body": "LGTM"},
+        }
+        self.assertEqual(
+            route(cfg(), "issue_comment", payload_non_jules),
+            "ignored issue comment without /jules",
+        )
+
+        payload_empty = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 1},
+            "comment": {"body": "/jules"},
+        }
+        mock_gh = mock_gh_cls.return_value
+        existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
+        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        self.assertEqual(
+            route(cfg(), "issue_comment", payload_empty),
+            "ignored empty /jules command",
+        )
+
+    def test_dry_run_mode(self):
+        payload = {
+            "repository": {"full_name": "owner/repo"},
+            "issue": {"number": 7, "title": "Test", "labels": [{"name": "jules:run"}]},
+        }
+        with patch("github_agent_router.router.GitHubClient") as mock_gh:
+            mock_gh.return_value.comments.return_value = []
+            result = route(cfg(dry_run=True), "issues", payload)
+            self.assertIn("dry-run: would route #7 to Jules a", result)
+
+
+class SetupAndCheckTests(unittest.TestCase):
+    @patch("github_agent_router.github.GitHubClient._request")
+    def test_setup_labels(self, mock_request):
+        gh = GitHubClient("token", "owner/repo")
+        labels = gh.setup_labels()
+        self.assertEqual(len(labels), len(REQUIRED_LABELS))
+        self.assertIn("jules:run", labels)
+        self.assertIn("jules-owner:a", labels)
+        self.assertIn("jules-owner:b", labels)
+        self.assertIn("jules:needs-user", labels)
+        self.assertIn("agent:jules", labels)
+
+    @patch("github_agent_router.router.JulesClient")
+    def test_check_credentials(self, mock_jules_cls):
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.list_sources.return_value = [
+            {"githubRepo": {"owner": "owner", "repo": "repo"}}
+        ]
+        code = check_credentials(cfg())
+        self.assertEqual(code, 0)
+
+    def test_generate_workflow_content(self):
+        from github_agent_router.router import generate_workflow_content
+        content = generate_workflow_content(home="b", overflow="a", max_rounds=3, auto_review_prs=True)
+        self.assertIn("home: b", content)
+        self.assertIn('overflow: "a"', content)
+        self.assertIn("max_rounds: 3", content)
+        self.assertIn("auto_review_prs: true", content)
+
+    @patch("github_agent_router.github.GitHubClient._request")
+    def test_provision_repo(self, mock_request):
+        from github_agent_router.router import provision_repo
+        mock_request.return_value = {}
+        provision_repo(cfg(), "target/repo", home="a", overflow="b")
+        # Ensure requests were made for setup labels and put_file
+        self.assertTrue(mock_request.called)
 
 
 if __name__ == "__main__":
     unittest.main()
+

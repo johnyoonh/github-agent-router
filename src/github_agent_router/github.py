@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 from urllib import error, parse, request
 
 
+
 API = "https://api.github.com"
+
+
+REQUIRED_LABELS: list[tuple[str, str, str]] = [
+    ("jules:run", "0e8a16", "Opt-in to autonomous Jules review and routing"),
+    ("jules-owner:a", "1d76db", "Sticky Jules identity A ownership"),
+    ("jules-owner:b", "5319e7", "Sticky Jules identity B ownership"),
+    ("jules:needs-user", "d93f0b", "Jules is waiting for user clarification or review cap reached"),
+    ("agent:jules", "fbca04", "Authored by Jules; excluded from autonomous review loops"),
+]
 
 
 class GitHubError(RuntimeError):
@@ -42,8 +53,15 @@ class GitHubClient:
             return {}
         return json.loads(raw)
 
+    def get_repo(self) -> dict[str, Any]:
+        return self._request("GET", f"/repos/{self.owner}/{self.repo}")
+
+    def is_private(self) -> bool:
+        return bool(self.get_repo().get("private", False))
+
     def comments(self, number: int) -> list[dict[str, Any]]:
         return self._request("GET", f"/repos/{self.owner}/{self.repo}/issues/{number}/comments?per_page=100")
+
 
     def add_comment(self, number: int, body: str) -> dict[str, Any]:
         return self._request("POST", f"/repos/{self.owner}/{self.repo}/issues/{number}/comments", {"body": body})
@@ -51,14 +69,25 @@ class GitHubClient:
     def update_comment(self, comment_id: int, body: str) -> dict[str, Any]:
         return self._request("PATCH", f"/repos/{self.owner}/{self.repo}/issues/comments/{comment_id}", {"body": body})
 
-    def ensure_label(self, name: str, color: str = "6f42c1") -> None:
+    def ensure_label(self, name: str, color: str = "6f42c1", description: str = "") -> None:
         encoded = parse.quote(name, safe="")
+        payload: dict[str, str] = {"name": name, "color": color}
+        if description:
+            payload["description"] = description
         try:
             self._request("GET", f"/repos/{self.owner}/{self.repo}/labels/{encoded}")
         except GitHubError as exc:
             if "404" not in str(exc):
                 raise
-            self._request("POST", f"/repos/{self.owner}/{self.repo}/labels", {"name": name, "color": color})
+            self._request("POST", f"/repos/{self.owner}/{self.repo}/labels", payload)
+
+    def setup_labels(self) -> list[str]:
+        ensured = []
+        for name, color, desc in REQUIRED_LABELS:
+            self.ensure_label(name, color, desc)
+            ensured.append(name)
+        return ensured
+
 
     def add_labels(self, number: int, labels: list[str]) -> None:
         for label in labels:
@@ -79,3 +108,31 @@ class GitHubClient:
                 self.update_comment(int(comment["id"]), body)
                 return
         self.add_comment(number, body)
+
+    def get_file(self, path: str, ref: str | None = None) -> dict[str, Any] | None:
+        query = f"?ref={parse.quote(ref)}" if ref else ""
+        try:
+            return self._request("GET", f"/repos/{self.owner}/{self.repo}/contents/{path}{query}")
+        except GitHubError as exc:
+            if "404" in str(exc):
+                return None
+            raise
+
+    def put_file(
+        self,
+        path: str,
+        content: str,
+        message: str,
+        branch: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_file(path, ref=branch)
+        payload: dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        }
+        if existing and "sha" in existing:
+            payload["sha"] = existing["sha"]
+        if branch:
+            payload["branch"] = branch
+        return self._request("PUT", f"/repos/{self.owner}/{self.repo}/contents/{path}", payload)
+
