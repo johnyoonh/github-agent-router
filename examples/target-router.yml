@@ -8,12 +8,18 @@ on:
   issue_comment:
     types: [created]
 
+concurrency:
+  group: jules-router-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   jules:
     uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
     with:
       home: auto
       overflow: auto
+      private_home: a
+      public_home: b
       max_rounds: 2
       auto_review_prs: false
     secrets:

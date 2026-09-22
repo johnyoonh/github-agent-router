@@ -198,6 +198,8 @@ jobs:
     with:
       home: auto
       overflow: auto
+      private_home: a
+      public_home: b
       max_rounds: 2
       auto_review_prs: false
     secrets:
@@ -206,6 +208,8 @@ jobs:
 ```
 
 `home: auto` selects Jules A for private repositories and Jules B for public repositories. `overflow: auto` selects the other account only when the preferred account is unavailable.
+
+Provisioned workflows serialize events for each issue or pull request without cancelling an in-flight run, so the owner label cannot start a competing session before the session marker is persisted.
 
 For a B-owned or to-be-public repository, use an explicit B home:
 

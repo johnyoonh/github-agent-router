@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 from github_agent_router.config import Config
 
-from github_agent_router.github import GitHubClient, REQUIRED_LABELS
+from github_agent_router.github import GitHubClient, GitHubError, REQUIRED_LABELS
 from github_agent_router.jules import JulesClient, JulesError
 from github_agent_router.router import (
     RouteState,
@@ -294,6 +294,20 @@ class RouteFlowTests(unittest.TestCase):
 
         self.assertIn("created sessions/auto-overflow-b on Jules b", result)
 
+    def test_persist_records_session_before_owner_label(self):
+        from github_agent_router.router import persist
+
+        events = []
+        gh = MagicMock()
+        gh.setup_labels.side_effect = lambda: events.append("setup_labels")
+        gh.upsert_router_comment.side_effect = lambda *args: events.append("comment")
+        gh.add_labels.side_effect = lambda *args: events.append("owner_label")
+        gh.remove_label.side_effect = lambda *args: events.append("remove_other")
+
+        persist(gh, 4, RouteState("a", "sessions/4"))
+
+        self.assertEqual(events, ["setup_labels", "comment", "owner_label", "remove_other"])
+
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
     def test_route_active_session_continuation(self, mock_jules_cls, mock_gh_cls):
@@ -308,9 +322,10 @@ class RouteFlowTests(unittest.TestCase):
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
         }
-        result = route(cfg(), "issues", payload)
+        result = route(cfg(home="auto", overflow="auto"), "issues", payload)
         self.assertIn("continued active sticky session sessions/s1", result)
         mock_jules.send_message.assert_called()
+        mock_gh.is_private.assert_not_called()
 
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
@@ -446,6 +461,13 @@ class SetupAndCheckTests(unittest.TestCase):
         mock_request.assert_called_once_with("GET", "/repos/owner/repo")
 
     @patch("github_agent_router.github.GitHubClient._request")
+    def test_repository_visibility_requires_boolean_response(self, mock_request):
+        for response in ({}, {"private": "false"}):
+            mock_request.return_value = response
+            with self.assertRaisesRegex(GitHubError, "boolean private"):
+                GitHubClient("token", "owner/repo").is_private()
+
+    @patch("github_agent_router.github.GitHubClient._request")
     def test_setup_labels(self, mock_request):
         gh = GitHubClient("token", "owner/repo")
         labels = gh.setup_labels()
@@ -465,6 +487,12 @@ class SetupAndCheckTests(unittest.TestCase):
         code = check_credentials(cfg())
         self.assertEqual(code, 0)
 
+    def test_check_credentials_fails_without_github_token(self):
+        self.assertEqual(
+            check_credentials(cfg(github_token="", jules_keys={"a": "", "b": ""})),
+            1,
+        )
+
     def test_generate_workflow_content(self):
         from github_agent_router.router import generate_workflow_content
         content = generate_workflow_content(home="b", overflow="a", max_rounds=3, auto_review_prs=True)
@@ -472,6 +500,22 @@ class SetupAndCheckTests(unittest.TestCase):
         self.assertIn('overflow: "a"', content)
         self.assertIn("max_rounds: 3", content)
         self.assertIn("auto_review_prs: true", content)
+
+    def test_generate_workflow_includes_visibility_owner_inputs(self):
+        from github_agent_router.router import generate_workflow_content
+
+        content = generate_workflow_content()
+
+        self.assertIn("private_home: a", content)
+        self.assertIn("public_home: b", content)
+
+    def test_generate_workflow_serializes_repository_runs(self):
+        from github_agent_router.router import generate_workflow_content
+
+        content = generate_workflow_content()
+
+        self.assertIn("concurrency:", content)
+        self.assertIn("cancel-in-progress: false", content)
 
     def test_generate_workflow_defaults_to_visibility_routing(self):
         from github_agent_router.router import generate_workflow_content

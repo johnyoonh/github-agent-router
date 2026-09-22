@@ -57,7 +57,10 @@ class GitHubClient:
         return self._request("GET", f"/repos/{self.owner}/{self.repo}")
 
     def is_private(self) -> bool:
-        return bool(self.get_repo().get("private", False))
+        private = self.get_repo().get("private")
+        if not isinstance(private, bool):
+            raise GitHubError("GitHub API response missing boolean private field")
+        return private
 
     def comments(self, number: int) -> list[dict[str, Any]]:
         return self._request("GET", f"/repos/{self.owner}/{self.repo}/issues/{number}/comments?per_page=100")

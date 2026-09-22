@@ -12,6 +12,16 @@ on:
         required: false
         default: auto
         type: string
+      private_home:
+        description: Jules account for private repositories when home is auto
+        required: false
+        default: a
+        type: string
+      public_home:
+        description: Jules account for public repositories when home is auto
+        required: false
+        default: b
+        type: string
       max_rounds:
         description: Maximum autonomous Jules rounds per issue/PR
         required: false
@@ -51,6 +61,8 @@ jobs:
           GITHUB_EVENT_JSON: ${{ toJSON(github.event) }}
           JULES_HOME: ${{ inputs.home }}
           JULES_OVERFLOW: ${{ inputs.overflow }}
+          JULES_PRIVATE_HOME: ${{ inputs.private_home }}
+          JULES_PUBLIC_HOME: ${{ inputs.public_home }}
           JULES_MAX_ROUNDS: ${{ inputs.max_rounds }}
           JULES_AUTO_REVIEW_PRS: ${{ inputs.auto_review_prs }}
           JULES_A_API_KEY: ${{ secrets.jules_a_api_key }}

@@ -180,10 +180,10 @@ def event_message(event_name: str, payload: dict[str, Any]) -> str:
 
 def persist(gh: GitHubClient, number: int, state: RouteState) -> None:
     gh.setup_labels()
+    gh.upsert_router_comment(number, MARKER_PREFIX, state.comment())
     gh.add_labels(number, [f"jules-owner:{state.owner}"])
     other = "b" if state.owner == "a" else "a"
     gh.remove_label(number, f"jules-owner:{other}")
-    gh.upsert_router_comment(number, MARKER_PREFIX, state.comment())
 
 
 def create_for_owner(
@@ -362,6 +362,7 @@ def check_credentials(config: Config) -> int:
         print("  [GitHub] GITHUB_TOKEN is set")
     else:
         print("  [GitHub] GITHUB_TOKEN is not set")
+        ok = False
     return 0 if ok else 1
 
 
@@ -379,6 +380,8 @@ def generate_workflow_content(
     overflow: str = "auto",
     max_rounds: int = 2,
     auto_review_prs: bool = False,
+    private_home: str = "a",
+    public_home: str = "b",
 ) -> str:
     overflow_val = f'"{overflow}"' if overflow else '""'
     auto_review_val = "true" if auto_review_prs else "false"
@@ -392,12 +395,18 @@ on:
   issue_comment:
     types: [created]
 
+concurrency:
+  group: jules-router-${{{{ github.repository }}}}-${{{{ github.event.issue.number || github.event.pull_request.number || github.run_id }}}}
+  cancel-in-progress: false
+
 jobs:
   jules:
     uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
     with:
       home: {home}
       overflow: {overflow_val}
+      private_home: {private_home}
+      public_home: {public_home}
       max_rounds: {max_rounds}
       auto_review_prs: {auto_review_val}
     secrets:
@@ -414,6 +423,8 @@ def provision_repo(
     max_rounds: int = 2,
     auto_review_prs: bool = False,
     branch: str | None = None,
+    private_home: str = "a",
+    public_home: str = "b",
 ) -> None:
     """Provisions a target repository on GitHub: ensures labels and commits workflow."""
     if not config.github_token:
@@ -423,7 +434,14 @@ def provision_repo(
     ensured = gh.setup_labels()
     print(f"  [Labels] Ensured {len(ensured)} labels: {', '.join(ensured)}")
 
-    workflow_content = generate_workflow_content(home, overflow, max_rounds, auto_review_prs)
+    workflow_content = generate_workflow_content(
+        home,
+        overflow,
+        max_rounds,
+        auto_review_prs,
+        private_home,
+        public_home,
+    )
     workflow_path = ".github/workflows/jules-router.yml"
     gh.put_file(
         path=workflow_path,
@@ -477,6 +495,8 @@ def main(argv: list[str] | None = None) -> None:
                 overflow=config.overflow or "",
                 max_rounds=config.max_rounds,
                 auto_review_prs=config.auto_review_prs,
+                private_home=config.private_home,
+                public_home=config.public_home,
             )
         return
 
