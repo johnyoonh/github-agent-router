@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any
+
 
 from .config import Config
 from .github import GitHubClient
@@ -452,6 +454,146 @@ def provision_repo(
     print(f"  [Workflow] Created/updated {workflow_path}")
 
 
+def git_remote_slug(repo_path: str) -> str | None:
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        url = res.stdout.strip()
+        m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def scan_workspace_repos(
+    roots: list[str] | None = None,
+    owner_filter: str | None = "johnyoonh",
+) -> list[dict[str, Any]]:
+    """Discovers git repos across workspace roots and assigns routing policy:
+    ~/repos -> private -> home: a, overflow: b
+    ~/chrome, ~/github, ~/obsidian -> public/to-be-public -> home: b, overflow: a
+    """
+    home_dir = os.path.expanduser("~")
+    real_home = "/Users/john" if os.path.isdir("/Users/john") else home_dir
+
+    candidate_roots = roots or [
+        os.path.join(real_home, "repos"),
+        os.path.join(real_home, "chrome"),
+        os.path.join(real_home, "github"),
+        os.path.join(real_home, "obsidian"),
+    ]
+
+    discovered: list[dict[str, Any]] = []
+    for root in candidate_roots:
+        if not os.path.isdir(root):
+            continue
+        root_name = os.path.basename(os.path.abspath(root))
+        default_home, default_overflow = ("a", "b") if root_name == "repos" else ("b", "a")
+
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+
+        for entry in entries:
+            path = os.path.join(root, entry)
+            if not os.path.isdir(path) or not os.path.isdir(os.path.join(path, ".git")):
+                continue
+            slug = git_remote_slug(path)
+            if not slug:
+                continue
+            if owner_filter and not slug.lower().startswith(f"{owner_filter.lower()}/"):
+                continue
+
+            discovered.append({
+                "path": path,
+                "name": entry,
+                "root": root_name,
+                "slug": slug,
+                "home": default_home,
+                "overflow": default_overflow,
+            })
+    return discovered
+
+
+def provision_workspace(
+    config: Config,
+    roots: list[str] | None = None,
+    apply: bool = False,
+    set_secrets: bool = False,
+    owner_filter: str | None = "johnyoonh",
+    filter_pattern: str | None = None,
+    write_local: bool = False,
+) -> list[dict[str, Any]]:
+    repos = scan_workspace_repos(roots, owner_filter=owner_filter)
+    if filter_pattern:
+        pat = filter_pattern.lower()
+        repos = [r for r in repos if pat in r["slug"].lower() or pat in r["name"].lower()]
+
+    print(f"Discovered {len(repos)} managed repositories across workspace roots:")
+    print("-" * 88)
+    print(f"{'Root':<10} {'Repository Slug':<36} {'Assigned Jules':<16} {'Action'}")
+    print("-" * 88)
+
+    for item in repos:
+        policy = f"home:{item['home']} (over:{item['overflow']})"
+        action_msg = "WILL PROVISION" if apply else "DRY RUN"
+        print(f"{item['root']:<10} {item['slug']:<36} {policy:<16} {action_msg}")
+
+        if apply:
+            try:
+                if write_local and os.path.isdir(item["path"]):
+                    wf_content = generate_workflow_content(
+                        home=item["home"],
+                        overflow=item["overflow"],
+                        max_rounds=config.max_rounds,
+                        auto_review_prs=config.auto_review_prs,
+                    )
+                    wf_dir = os.path.join(item["path"], ".github", "workflows")
+                    os.makedirs(wf_dir, exist_ok=True)
+                    wf_file = os.path.join(wf_dir, "jules-router.yml")
+                    with open(wf_file, "w", encoding="utf-8") as f:
+                        f.write(wf_content)
+                    print(f"  [Local File] Written to {wf_file}")
+                    if config.github_token:
+                        gh = GitHubClient(config.github_token, item["slug"])
+                        gh.setup_labels()
+                else:
+                    provision_repo(
+                        config=config,
+                        repo_full_name=item["slug"],
+                        home=item["home"],
+                        overflow=item["overflow"],
+                        max_rounds=config.max_rounds,
+                        auto_review_prs=config.auto_review_prs,
+                    )
+
+                if set_secrets:
+                    key_a = config.jules_keys.get("a", "")
+                    key_b = config.jules_keys.get("b", "")
+                    if key_a:
+                        subprocess.run(["gh", "secret", "set", "JULES_A_API_KEY", "-R", item["slug"], "--body", key_a], check=True)
+                    if key_b:
+                        subprocess.run(["gh", "secret", "set", "JULES_B_API_KEY", "-R", item["slug"], "--body", key_b], check=True)
+                    print(f"  [Secrets] Pushed JULES_A/B secrets to {item['slug']}")
+
+            except Exception as exc:
+                print(f"  ERROR provisioning {item['slug']}: {exc}", file=sys.stderr)
+
+    if not apply:
+        print("-" * 88)
+        print("Dry run complete. Run with --apply to push labels and workflows to GitHub.")
+        print("Flags: --apply, --set-secrets (pushes API keys via gh), --local (writes to local checkout), --filter <name>")
+
+    return repos
+
+
 def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     config = Config.from_env()
@@ -462,6 +604,8 @@ def main(argv: list[str] | None = None) -> None:
         print("  github-agent-router check                          Verify Jules API keys and GitHub token")
         print("  github-agent-router setup-labels <repo> [repo2...] Ensure required labels exist on repo(s)")
         print("  github-agent-router provision <repo> [repo2...]    Ensure labels and install visibility-aware jules-router.yml")
+        print("  github-agent-router provision-workspace [options]  Batch provision repos across ~/repos ~/chrome ~/github ~/obsidian")
+        print("                                                     Options: --apply, --local, --set-secrets, --filter <name>")
         return
 
     if args and args[0] == "check":
@@ -477,6 +621,23 @@ def main(argv: list[str] | None = None) -> None:
             repos = [repo]
         for r in repos:
             setup_repo_labels(config, r)
+        return
+
+    if args and args[0] == "provision-workspace":
+        apply = "--apply" in args
+        set_secrets = "--set-secrets" in args
+        write_local = "--local" in args
+        filter_val = None
+        for idx, arg in enumerate(args):
+            if arg == "--filter" and idx + 1 < len(args):
+                filter_val = args[idx + 1]
+        provision_workspace(
+            config,
+            apply=apply,
+            set_secrets=set_secrets,
+            write_local=write_local,
+            filter_pattern=filter_val,
+        )
         return
 
     if args and args[0] == "provision":
@@ -508,6 +669,6 @@ def main(argv: list[str] | None = None) -> None:
         raise
 
 
-
 if __name__ == "__main__":
     main()
+

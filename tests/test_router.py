@@ -533,6 +533,30 @@ class SetupAndCheckTests(unittest.TestCase):
         # Ensure requests were made for setup labels and put_file
         self.assertTrue(mock_request.called)
 
+    @patch("github_agent_router.router.git_remote_slug")
+    def test_scan_workspace_repos_assigns_home_policy(self, mock_slug):
+        import tempfile
+        from github_agent_router.router import scan_workspace_repos
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repos_dir = os.path.join(tmp, "repos")
+            chrome_dir = os.path.join(tmp, "chrome")
+            for r in (repos_dir, chrome_dir):
+                repo_git = os.path.join(r, "my-project", ".git")
+                os.makedirs(repo_git)
+
+            mock_slug.side_effect = lambda path: "johnyoonh/" + os.path.basename(os.path.dirname(path))
+
+            results = scan_workspace_repos([repos_dir, chrome_dir], owner_filter="johnyoonh")
+            self.assertEqual(len(results), 2)
+            repos_item = next(x for x in results if x["root"] == "repos")
+            chrome_item = next(x for x in results if x["root"] == "chrome")
+            self.assertEqual(repos_item["home"], "a")
+            self.assertEqual(repos_item["overflow"], "b")
+            self.assertEqual(chrome_item["home"], "b")
+            self.assertEqual(chrome_item["overflow"], "a")
+
 
 if __name__ == "__main__":
     unittest.main()
+

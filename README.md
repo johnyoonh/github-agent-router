@@ -168,6 +168,40 @@ JULES_HOME=b JULES_OVERFLOW=a \
 
 The router also automatically ensures all 5 labels exist on any repository whenever it persists an issue or PR session.
 
+### Workspace Root Policy (`provision-workspace`)
+
+To configure multiple repositories at once aligned with your workspace layout:
+- **`~/repos`**: Private tools, automation, and internal scripts &rarr; routed to **Jules A** (`home: a`, `overflow: b`).
+- **`~/chrome`**: Chrome extensions &rarr; routed to **Jules B** (`home: b`, `overflow: a`).
+- **`~/github`**: Public repositories &rarr; routed to **Jules B** (`home: b`, `overflow: a`).
+- **`~/obsidian`**: Obsidian plugins and plugin experiments &rarr; routed to **Jules B** (`home: b`, `overflow: a`).
+
+Preview routing for all managed repositories across all 4 roots:
+
+```bash
+github-agent-router provision-workspace
+```
+
+Filter by repository name or substring:
+
+```bash
+github-agent-router provision-workspace --filter chatgpt-opencli
+```
+
+Apply labels and push the target workflow to GitHub:
+
+```bash
+GITHUB_TOKEN=... github-agent-router provision-workspace --apply
+```
+
+Optionally push API secrets to GitHub Actions using the `gh` CLI:
+
+```bash
+GITHUB_TOKEN=... JULES_A_API_KEY=... JULES_B_API_KEY=... \
+  github-agent-router provision-workspace --apply --set-secrets
+```
+
+
 ### 6. Add the target workflow
 
 If not using `github-agent-router provision`, copy [`examples/target-router.yml`](examples/target-router.yml) to:
