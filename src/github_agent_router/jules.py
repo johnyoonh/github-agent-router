@@ -106,4 +106,3 @@ class JulesClient:
             token = data.get("nextPageToken", "")
             if not token:
                 return activities
-

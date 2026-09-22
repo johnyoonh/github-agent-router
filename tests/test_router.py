@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 import unittest
@@ -20,6 +21,7 @@ from github_agent_router.router import (
     event_message,
     owner_from_labels,
     parse_route_state,
+    preferred_home,
     route,
     setup_repo_labels,
     should_route_pr,
@@ -59,6 +61,40 @@ class RouterUnitTests(unittest.TestCase):
     def test_unknown_home_raises_value_error(self):
         with self.assertRaises(ValueError):
             choose_owner(set(), cfg(home="c"))
+
+    def test_auto_home_uses_repository_visibility(self):
+        config = cfg(home="auto", overflow="auto", private_home="a", public_home="b")
+        self.assertEqual(preferred_home(config, repository_private=True), "a")
+        self.assertEqual(preferred_home(config, repository_private=False), "b")
+        self.assertEqual(choose_owner(set(), config, repository_private=True), "a")
+        self.assertEqual(choose_owner(set(), config, repository_private=False), "b")
+
+    def test_auto_overflow_uses_the_other_account(self):
+        config = cfg(
+            home="auto",
+            overflow="auto",
+            private_home="a",
+            public_home="b",
+            jules_keys={"a": "", "b": "key-b"},
+        )
+        self.assertEqual(choose_owner(set(), config, repository_private=True), "b")
+
+    def test_auto_home_requires_visibility(self):
+        with self.assertRaisesRegex(ValueError, "repository visibility"):
+            choose_owner(set(), cfg(home="auto", overflow="auto"))
+
+    def test_explicit_home_overrides_visibility_for_to_be_public_repo(self):
+        config = cfg(home="b", overflow="auto", private_home="a", public_home="b")
+        self.assertEqual(preferred_home(config, repository_private=True), "b")
+
+    def test_environment_defaults_to_visibility_routing(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = Config.from_env()
+
+        self.assertEqual(config.home, "auto")
+        self.assertEqual(config.overflow, "auto")
+        self.assertEqual(config.private_home, "a")
+        self.assertEqual(config.public_home, "b")
 
     def test_owner_labels(self):
         self.assertEqual(owner_from_labels({"bug", "jules-owner:a"}), "a")
@@ -171,8 +207,33 @@ class RouteFlowTests(unittest.TestCase):
         }
         result = route(cfg(), "issues", payload)
         self.assertIn("created sessions/s1 on Jules a", result)
+        mock_gh.setup_labels.assert_called_once_with()
         mock_gh.add_labels.assert_called_with(1, ["jules-owner:a"])
         mock_gh.upsert_router_comment.assert_called()
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_auto_home_uses_public_repository_for_jules_b(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        mock_gh.comments.return_value = []
+        mock_gh.is_private.return_value = False
+        mock_jules = mock_jules_cls.return_value
+        mock_jules.find_source.return_value = "sources/public"
+        mock_jules.create_session.return_value = {
+            "name": "sessions/public-b",
+            "url": "https://jules.google/public-b",
+            "state": "IN_PROGRESS",
+        }
+
+        payload = {
+            "repository": {"full_name": "owner/public-repo"},
+            "issue": {"number": 2, "title": "Public", "labels": [{"name": "jules:run"}]},
+        }
+        result = route(cfg(home="auto", overflow="auto"), "issues", payload)
+
+        self.assertIn("created sessions/public-b on Jules b", result)
+        mock_jules_cls.assert_called_once_with("key-b")
+        mock_gh.is_private.assert_called_once_with()
 
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
@@ -202,6 +263,36 @@ class RouteFlowTests(unittest.TestCase):
         result = route(cfg(home="a", overflow="b"), "issues", payload)
         self.assertIn("created sessions/overflow-b on Jules b", result)
         mock_gh.add_labels.assert_called_with(1, ["jules-owner:b"])
+
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_route_auto_overflow_on_429_uses_other_account(self, mock_jules_cls, mock_gh_cls):
+        mock_gh = mock_gh_cls.return_value
+        mock_gh.comments.return_value = []
+        mock_gh.is_private.return_value = True
+
+        def client_side_effect(api_key):
+            client = MagicMock()
+            if api_key == "key-a":
+                client.find_source.side_effect = JulesError(429, "rate limited")
+            else:
+                client.find_source.return_value = "sources/b123"
+                client.create_session.return_value = {
+                    "name": "sessions/auto-overflow-b",
+                    "url": "https://jules.google/auto-overflow-b",
+                    "state": "IN_PROGRESS",
+                }
+            return client
+
+        mock_jules_cls.side_effect = client_side_effect
+
+        payload = {
+            "repository": {"full_name": "owner/private-repo"},
+            "issue": {"number": 3, "title": "Private", "labels": [{"name": "jules:run"}]},
+        }
+        result = route(cfg(home="auto", overflow="auto"), "issues", payload)
+
+        self.assertIn("created sessions/auto-overflow-b on Jules b", result)
 
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
@@ -348,6 +439,13 @@ class RouteFlowTests(unittest.TestCase):
 
 class SetupAndCheckTests(unittest.TestCase):
     @patch("github_agent_router.github.GitHubClient._request")
+    def test_repository_visibility_is_read_from_github(self, mock_request):
+        mock_request.return_value = {"private": True}
+
+        self.assertTrue(GitHubClient("token", "owner/repo").is_private())
+        mock_request.assert_called_once_with("GET", "/repos/owner/repo")
+
+    @patch("github_agent_router.github.GitHubClient._request")
     def test_setup_labels(self, mock_request):
         gh = GitHubClient("token", "owner/repo")
         labels = gh.setup_labels()
@@ -375,6 +473,14 @@ class SetupAndCheckTests(unittest.TestCase):
         self.assertIn("max_rounds: 3", content)
         self.assertIn("auto_review_prs: true", content)
 
+    def test_generate_workflow_defaults_to_visibility_routing(self):
+        from github_agent_router.router import generate_workflow_content
+
+        content = generate_workflow_content()
+
+        self.assertIn("home: auto", content)
+        self.assertIn('overflow: "auto"', content)
+
     @patch("github_agent_router.github.GitHubClient._request")
     def test_provision_repo(self, mock_request):
         from github_agent_router.router import provision_repo
@@ -386,4 +492,3 @@ class SetupAndCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

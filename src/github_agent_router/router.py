@@ -61,16 +61,45 @@ def owner_from_labels(labels: set[str]) -> str | None:
     return None
 
 
-def choose_owner(labels: set[str], config: Config) -> str:
+def preferred_home(config: Config, repository_private: bool | None = None) -> str:
+    """Resolve the configured primary Jules account for a repository."""
+    if config.home == "auto":
+        if repository_private is None:
+            raise ValueError("repository visibility is required when JULES_HOME=auto")
+        home = config.private_home if repository_private else config.public_home
+    else:
+        home = config.home
+    if home not in config.jules_keys:
+        setting = "JULES_PRIVATE_HOME" if repository_private else "JULES_PUBLIC_HOME"
+        if config.home != "auto":
+            setting = "JULES_HOME"
+        raise ValueError(f"unknown {setting}={home}")
+    return home
+
+
+def _overflow_owner(config: Config, home: str) -> str | None:
+    overflow = config.overflow
+    if overflow == "auto":
+        overflow = "b" if home == "a" else "a"
+    if overflow is not None and overflow not in config.jules_keys:
+        raise ValueError(f"unknown JULES_OVERFLOW={overflow}")
+    return overflow
+
+
+def choose_owner(
+    labels: set[str],
+    config: Config,
+    repository_private: bool | None = None,
+) -> str:
     sticky = owner_from_labels(labels)
     if sticky:
         return sticky
-    if config.home not in config.jules_keys:
-        raise ValueError(f"unknown JULES_HOME={config.home}")
-    if config.jules_keys.get(config.home):
-        return config.home
-    if config.overflow and config.jules_keys.get(config.overflow):
-        return config.overflow
+    home = preferred_home(config, repository_private)
+    if config.jules_keys.get(home):
+        return home
+    overflow = _overflow_owner(config, home)
+    if overflow and config.jules_keys.get(overflow):
+        return overflow
     raise ValueError("no configured Jules API key is available")
 
 
@@ -255,7 +284,10 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
         persist(gh, number, state)
         return f"continued active sticky session {state.session}"
 
-    owner = sticky_owner or choose_owner(labels, config)
+    repository_private = None
+    if not sticky_owner and config.home == "auto":
+        repository_private = gh.is_private()
+    owner = sticky_owner or choose_owner(labels, config, repository_private=repository_private)
     if config.dry_run:
         return f"dry-run: would route #{number} to Jules {owner}"
 
@@ -271,11 +303,12 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
         )
     except (JulesError, LookupError) as exc:
         # Overflow is allowed only for never-claimed work.
-        if sticky_owner or not config.overflow or config.overflow == owner or not config.jules_keys.get(config.overflow):
+        overflow_owner = _overflow_owner(config, owner)
+        if sticky_owner or not overflow_owner or overflow_owner == owner or not config.jules_keys.get(overflow_owner):
             raise
         if isinstance(exc, JulesError) and exc.status != 429:
             raise
-        owner = config.overflow
+        owner = overflow_owner
         new_state = create_for_owner(
             owner=owner,
             config=config,
@@ -342,8 +375,8 @@ def setup_repo_labels(config: Config, repo_full_name: str) -> None:
 
 
 def generate_workflow_content(
-    home: str = "a",
-    overflow: str = "b",
+    home: str = "auto",
+    overflow: str = "auto",
     max_rounds: int = 2,
     auto_review_prs: bool = False,
 ) -> str:
@@ -376,8 +409,8 @@ jobs:
 def provision_repo(
     config: Config,
     repo_full_name: str,
-    home: str = "a",
-    overflow: str = "b",
+    home: str = "auto",
+    overflow: str = "auto",
     max_rounds: int = 2,
     auto_review_prs: bool = False,
     branch: str | None = None,
@@ -410,7 +443,7 @@ def main(argv: list[str] | None = None) -> None:
         print("  github-agent-router                                Route GitHub event from environment")
         print("  github-agent-router check                          Verify Jules API keys and GitHub token")
         print("  github-agent-router setup-labels <repo> [repo2...] Ensure required labels exist on repo(s)")
-        print("  github-agent-router provision <repo> [repo2...]    Ensure labels and install jules-router.yml")
+        print("  github-agent-router provision <repo> [repo2...]    Ensure labels and install visibility-aware jules-router.yml")
         return
 
     if args and args[0] == "check":
@@ -458,4 +491,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

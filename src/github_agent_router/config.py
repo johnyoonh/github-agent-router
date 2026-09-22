@@ -15,8 +15,10 @@ def _bool(name: str, default: bool = False) -> bool:
 class Config:
     github_token: str
     jules_keys: dict[str, str]
-    home: str = "a"
-    overflow: str | None = "b"
+    home: str = "auto"
+    overflow: str | None = "auto"
+    private_home: str = "a"
+    public_home: str = "b"
     max_rounds: int = 2
     auto_review_prs: bool = False
     dry_run: bool = False
@@ -27,12 +29,14 @@ class Config:
             "a": os.getenv("JULES_A_API_KEY", "").strip(),
             "b": os.getenv("JULES_B_API_KEY", "").strip(),
         }
-        overflow = os.getenv("JULES_OVERFLOW", "b").strip() or None
+        overflow = os.getenv("JULES_OVERFLOW", "auto").strip().lower() or None
         return cls(
             github_token=os.getenv("GITHUB_TOKEN", "").strip(),
             jules_keys=keys,
-            home=os.getenv("JULES_HOME", "a").strip().lower(),
-            overflow=overflow.lower() if overflow else None,
+            home=os.getenv("JULES_HOME", "auto").strip().lower() or "auto",
+            overflow=overflow,
+            private_home=os.getenv("JULES_PRIVATE_HOME", "a").strip().lower() or "a",
+            public_home=os.getenv("JULES_PUBLIC_HOME", "b").strip().lower() or "b",
             max_rounds=max(1, int(os.getenv("JULES_MAX_ROUNDS", "2"))),
             auto_review_prs=_bool("JULES_AUTO_REVIEW_PRS", False),
             dry_run=_bool("AGENT_ROUTER_DRY_RUN", False),

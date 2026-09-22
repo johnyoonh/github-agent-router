@@ -7,7 +7,7 @@ This repository is the execution layer for a workflow where ChatGPT.com can crea
 ## What is implemented
 
 - Two Jules executors: **A** and **B**, each authenticated by its own Jules API key.
-- Per-repository home account with optional overflow for **unclaimed** work.
+- Visibility-aware per-repository home account with optional overflow for **unclaimed** work.
 - Sticky issue/PR ownership using `jules-owner:a` / `jules-owner:b`.
 - Sticky Jules session metadata stored in a machine-readable GitHub comment.
 - Existing active sessions are continued instead of creating a new session.
@@ -30,7 +30,7 @@ new issue / PR
 already has jules-owner?
   | yes                | no
   v                    v
-same account       repo home account
+same account       visibility-aware home account
   |                    |
 same session       unavailable/rate-limited?
   |                    |
@@ -50,7 +50,7 @@ Priority is:
 
 1. Existing Jules session.
 2. Existing `jules-owner:a|b` label.
-3. Repository home account.
+3. Visibility-aware repository home account.
 4. Overflow account for never-claimed work only.
 
 ## Labels
@@ -95,7 +95,7 @@ github-agent-router check
 
 For every target repository, install/authorize the Jules GitHub integration from each Jules account that may receive that repository.
 
-A repository assigned `home: a` only strictly needs A unless B is configured as overflow. If `overflow: b`, both accounts must be able to see the repository in the Jules Sources API.
+With `home: auto`, private repositories prefer Jules A and public repositories prefer Jules B. `overflow: auto` selects the other account only for unclaimed work when the preferred account is unavailable. An explicit `home: a` or `home: b` remains the override for a repository that is intentionally being prepared for a visibility change.
 
 ### 3. Allow private repositories to call this reusable workflow
 
@@ -159,6 +159,13 @@ Even better, you can provision both the labels **and** the workflow file in one 
 GITHUB_TOKEN=... github-agent-router provision <owner/repo> [repo2...]
 ```
 
+The generated workflow uses `home: auto` and `overflow: auto`. For repositories that are still private but intentionally being prepared for public release, provision them with an explicit B home:
+
+```bash
+JULES_HOME=b JULES_OVERFLOW=a \
+  github-agent-router provision <owner/repo> [repo2...]
+```
+
 The router also automatically ensures all 5 labels exist on any repository whenever it persists an issue or PR session.
 
 ### 6. Add the target workflow
@@ -189,8 +196,8 @@ jobs:
   jules:
     uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
     with:
-      home: a
-      overflow: b
+      home: auto
+      overflow: auto
       max_rounds: 2
       auto_review_prs: false
     secrets:
@@ -198,7 +205,9 @@ jobs:
       jules_b_api_key: ${{ secrets.JULES_B_API_KEY }}
 ```
 
-For a B-owned repository, change:
+`home: auto` selects Jules A for private repositories and Jules B for public repositories. `overflow: auto` selects the other account only when the preferred account is unavailable.
+
+For a B-owned or to-be-public repository, use an explicit B home:
 
 ```yaml
 home: b
@@ -242,7 +251,7 @@ Create or update the issue and add:
 jules:run
 ```
 
-If it has no owner, the router selects the repository home account. If that account receives a Jules HTTP 429 before ownership is persisted and overflow is configured, the router may try the overflow account.
+If it has no owner, the router selects Jules A for a private repository and Jules B for a public repository unless the workflow explicitly sets `home`. If that account receives a Jules HTTP 429 before ownership is persisted and overflow is configured, the router may try the overflow account.
 
 After a session is created, the issue receives:
 
@@ -356,6 +365,8 @@ Keep declarative repository routing in your dotfiles, for example:
 ```yaml
 # github/agent-routing.yml
 defaults:
+  home: auto
+  overflow: auto
   max_rounds: 2
   auto_review_prs: false
 
@@ -404,8 +415,10 @@ GITHUB_EVENT_NAME
 GITHUB_EVENT_JSON or GITHUB_EVENT_PATH
 JULES_A_API_KEY
 JULES_B_API_KEY
-JULES_HOME=a|b
-JULES_OVERFLOW=a|b|empty
+JULES_HOME=auto|a|b
+JULES_PRIVATE_HOME=a|b
+JULES_PUBLIC_HOME=a|b
+JULES_OVERFLOW=auto|a|b|empty
 JULES_MAX_ROUNDS=2
 JULES_AUTO_REVIEW_PRS=false
 ```

@@ -12,8 +12,8 @@ jobs:
   jules:
     uses: ./.github/workflows/reusable-router.yml
     with:
-      home: a
-      overflow: b
+      home: auto
+      overflow: auto
       max_rounds: 2
       auto_review_prs: false
     secrets:

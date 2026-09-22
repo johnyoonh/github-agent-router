@@ -4,13 +4,13 @@ on:
   workflow_call:
     inputs:
       home:
-        description: Default Jules account for unclaimed work (a or b)
+        description: Default Jules account for unclaimed work (auto, a, or b; auto uses repository visibility)
         required: true
         type: string
       overflow:
-        description: Overflow account for unclaimed work only
+        description: Overflow account for unclaimed work only (auto selects the other account)
         required: false
-        default: b
+        default: auto
         type: string
       max_rounds:
         description: Maximum autonomous Jules rounds per issue/PR
