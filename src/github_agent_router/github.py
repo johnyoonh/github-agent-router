@@ -15,7 +15,12 @@ REQUIRED_LABELS: list[tuple[str, str, str]] = [
     ("jules:run", "0e8a16", "Opt-in to autonomous Jules review and routing"),
     ("jules-owner:a", "1d76db", "Sticky Jules identity A ownership"),
     ("jules-owner:b", "5319e7", "Sticky Jules identity B ownership"),
-    ("jules:needs-user", "d93f0b", "Jules is waiting for user clarification or review cap reached"),
+    ("jules:needs-user", "d93f0b", "Jules is waiting for a material user decision"),
+    ("jules:certified", "2da44e", "Jules behavioral and adversarial verification satisfied"),
+    ("jules:changes-required", "cf222e", "Jules found a verified shortcoming that must be addressed"),
+    ("agent:blocked", "d4c5f9", "Automation is blocked on evidence, permissions, or a material decision"),
+    ("chatgpt:handoff", "1f6feb", "Durable handoff to ChatGPT or a local evidence collector"),
+    ("agent:chatgpt", "8250df", "Trusted chatgpt/ branch routed for independent verification"),
     ("agent:jules", "fbca04", "Authored by Jules; excluded from autonomous review loops"),
 ]
 
@@ -148,6 +153,39 @@ class GitHubClient:
         except GitHubError as exc:
             if exc.status != 404:
                 raise
+
+    def ensure_handoff_issue(self, marker: str, title: str, body: str) -> int:
+        """Create or refresh one durable ChatGPT/local-evidence handoff issue."""
+        if not marker or marker not in body:
+            raise ValueError("handoff body must contain its stable marker")
+        labels = ["chatgpt:handoff", "agent:blocked"]
+        for label in labels:
+            self.ensure_label(label)
+        encoded = parse.quote("chatgpt:handoff", safe="")
+        for issue in self.paginated(
+            f"/repos/{self.repository}/issues?state=open&labels={encoded}"
+        ):
+            if issue.get("pull_request"):
+                continue
+            if marker not in (issue.get("body") or ""):
+                continue
+            number = int(issue["number"])
+            self._request(
+                "PATCH",
+                f"/repos/{self.repository}/issues/{number}",
+                {"title": title, "body": body},
+            )
+            self.add_labels(number, labels)
+            return number
+        created = self._request(
+            "POST",
+            f"/repos/{self.repository}/issues",
+            {"title": title, "body": body, "labels": labels},
+        )
+        number = created.get("number")
+        if type(number) is not int:
+            raise GitHubError("handoff issue creation returned no issue number")
+        return number
 
     def upsert_router_comment(self, number: int, marker_prefix: str, body: str) -> None:
         for comment in reversed(self.comments(number)):

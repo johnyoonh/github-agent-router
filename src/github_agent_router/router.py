@@ -8,6 +8,7 @@ import uuid
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -20,6 +21,19 @@ MARKER_PREFIX = "<!-- github-agent-router:"
 MARKER_RE = re.compile(r"<!-- github-agent-router:(\{.*?\}) -->", re.DOTALL)
 ACTIVE_STATES = {"QUEUED", "PLANNING", "AWAITING_PLAN_APPROVAL", "IN_PROGRESS", "PAUSED"}
 TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "CANCELED"}
+VERIFICATION_RE = re.compile(
+    r"<!-- github-agent-router:verification:(\{.*?\}) -->", re.DOTALL
+)
+CHATGPT_ORIGIN_RE = re.compile(
+    r"<!-- chatgpt-opencli:origin:(\{.*?\}) -->", re.DOTALL
+)
+VERDICTS = {"certified", "changes_required", "needs_evidence", "needs_user"}
+AUTONOMOUS_UNBLOCK_PROMPT = """Before waiting for user feedback, classify what is missing.
+Proceed without asking if code, tests, repository docs, or a conservative non-destructive
+assumption can answer it. If only machine-local evidence is unavailable, finish with a
+needs_evidence verification verdict and list the exact bounded logs/commands needed.
+Remain waiting for the user only for a material product, security, scope, or data-loss
+decision that cannot be inferred safely."""
 
 
 @dataclass
@@ -39,6 +53,9 @@ class RouteState:
     operation_event: str = ""
     comment_id: int = 0
     needs_user: bool = False
+    verification: str = ""
+    handoff_issue: int = 0
+    feedback_nudges: int = 0
 
     def comment(self, *, key: str = "") -> str:
         meta = asdict(self)
@@ -53,6 +70,10 @@ class RouteState:
             lines.append(f"Jules: {self.url}")
         if self.state:
             lines.append(f"State: **{self.state}**")
+        if self.verification:
+            lines.append(f"Verification: **{self.verification}**")
+        if self.handoff_issue:
+            lines.append(f"Handoff issue: **#{self.handoff_issue}**")
         return f"{MARKER_PREFIX}{json.dumps(meta, separators=(',', ':'))} -->\n\n" + "  \n".join(lines)
 
 
@@ -158,6 +179,12 @@ def parse_route_state(
                 raise ValueError("invalid session name")
             if not isinstance(state.events, list) or any(not isinstance(e, str) for e in state.events) or len(state.events) > 256:
                 raise ValueError("invalid event history")
+            if state.verification and state.verification not in VERDICTS | {"failed", "inconclusive"}:
+                raise ValueError("invalid verification state")
+            if type(state.handoff_issue) is not int or state.handoff_issue < 0:
+                raise ValueError("invalid handoff issue")
+            if type(state.feedback_nudges) is not int or state.feedback_nudges < 0:
+                raise ValueError("invalid feedback nudge count")
             return state, int(comment["id"])
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ValueError("malformed bot-authored routing state; reconcile before continuing") from exc
@@ -169,7 +196,12 @@ def should_route_pr(pr: dict[str, Any], config: Config) -> bool:
     head = str((pr.get("head") or {}).get("ref", ""))
     if "agent:jules" in labels or head.startswith(("jules/", "jules-", "google-jules/")):
         return False
-    return config.auto_review_prs or "jules:run" in labels or bool(owner_from_labels(labels))
+    return (
+        head.startswith("chatgpt/")
+        or config.auto_review_prs
+        or "jules:run" in labels
+        or bool(owner_from_labels(labels))
+    )
 
 
 def build_prompt(payload: dict[str, Any]) -> tuple[str, str, str, int, set[str]]:
@@ -183,17 +215,27 @@ def build_prompt(payload: dict[str, Any]) -> tuple[str, str, str, int, set[str]]
         labels = label_names(pr)
         title = f"Review PR #{number}: {pr.get('title', '')}"[:120]
         body = pr.get("body") or ""
-        prompt = f"""Review GitHub PR #{number} in {repo['full_name']} on branch {branch}.
+        head_sha = (pr.get("head") or {}).get("sha") or ""
+        prompt = f"""Independently verify GitHub PR #{number} in {repo['full_name']} on branch {branch} (head {head_sha}).
 
 PR title: {pr.get('title', '')}
 PR description:
 {body}
 
-Review against the stated intent and acceptance criteria. Inspect correctness, regressions, edge cases, security, error handling, concurrency, API/data compatibility, performance regressions, and missing tests.
+Act as an adversarial verification gate, not a style reviewer. Derive concrete behavioral success criteria from the request and changed code. Run the existing relevant tests and static checks, add focused regression or behavioral tests when coverage is missing, and deliberately probe realistic failure modes: edge/error paths, state transitions, concurrency/races, security boundaries, compatibility, and data-loss risks when relevant.
 
-Fix only verified problems. Add regression tests for behavioral bugs. Run relevant tests and static checks. Do not perform subjective cleanup or unrelated refactors. If product behavior is ambiguous or requires a user decision, ask for clarification rather than guessing.
+Fix only verified problems and keep fixes/tests scoped. Do not manufacture cleanup. Do not ask for routine confirmation, logs you can derive from the repository, or choices that have a conservative non-destructive answer. If machine-local evidence is truly required, do not wait indefinitely: return needs_evidence with the exact bounded commands/logs required. Use needs_user only for a material product, security, scope, or data-loss decision that cannot be inferred safely.
 
-If there are no meaningful problems, do not manufacture changes."""
+Your final agent message for every completed review round MUST contain exactly one marker with JSON:
+<!-- github-agent-router:verification:{{"verdict":"certified","summary":"concise evidence summary","tests":["command/result or not_applicable with reason"],"red_team":["adversarial case/result"],"requests":[]}} -->
+
+Allowed verdicts are certified, changes_required, needs_evidence, and needs_user.
+- certified: behavioral checks and at least one adversarial/red-team probe passed; no known merge-blocking shortcoming remains.
+- changes_required: a verified defect remains; describe it and any corrective PR/output.
+- needs_evidence: only external/local evidence is missing; requests must name the smallest safe evidence needed.
+- needs_user: a material decision is required; requests must contain the exact question.
+
+A terminal session without a valid marker is not certification."""
         return title, prompt, branch, number, labels
 
     issue = payload["issue"]
@@ -208,6 +250,106 @@ Issue body:
 
 Implement the requested behavior with the smallest coherent change. Preserve existing contracts unless the issue explicitly changes them. Add or update tests. Run relevant tests and static checks. If the requirement is materially ambiguous or a product decision is needed, ask for clarification rather than guessing."""
     return title, prompt, default_branch, number, labels
+
+
+def extract_verification(activities: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the newest structured Jules verification verdict."""
+    for activity in reversed(activities):
+        message = str((activity.get("agentMessaged") or {}).get("agentMessage", ""))
+        match = VERIFICATION_RE.search(message)
+        if not match:
+            continue
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Jules verification marker contains invalid JSON") from exc
+        verdict = value.get("verdict")
+        if verdict not in VERDICTS:
+            raise ValueError("Jules verification marker has an unknown verdict")
+        if not isinstance(value.get("summary"), str) or not value["summary"].strip():
+            raise ValueError("Jules verification marker requires summary")
+        for key in ("tests", "red_team", "requests"):
+            rows = value.get(key, [])
+            if not isinstance(rows, list) or any(not isinstance(x, str) for x in rows):
+                raise ValueError(f"Jules verification marker {key} must be a list of strings")
+            value[key] = rows
+        if verdict == "certified" and (not value["tests"] or not value["red_team"]):
+            raise ValueError("certification requires behavioral test and red-team evidence")
+        if verdict in {"needs_evidence", "needs_user"} and not value["requests"]:
+            raise ValueError(f"{verdict} requires an explicit request")
+        return value
+    return None
+
+
+def extract_chatgpt_origin(body: str) -> dict[str, str]:
+    """Read optional provenance emitted by chatgpt-opencli without trusting arbitrary URLs."""
+    match = CHATGPT_ORIGIN_RE.search(body or "")
+    if not match:
+        return {}
+    try:
+        raw = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    result: dict[str, str] = {}
+    conversation = raw.get("conversation")
+    if isinstance(conversation, str) and re.fullmatch(r"https://chatgpt\.com/(?:c|share)/[^\s]+", conversation):
+        result["conversation"] = conversation
+    for key in ("job_id", "project", "agents_sha"):
+        value = raw.get(key)
+        if isinstance(value, str) and value and len(value) <= 256:
+            result[key] = value
+    return result
+
+
+def ensure_handoff(
+    gh: GitHubClient,
+    payload: dict[str, Any],
+    state: RouteState,
+    verification: dict[str, Any],
+) -> int:
+    repo = payload["repository"]["full_name"].lower()
+    obj = payload.get("pull_request") or payload.get("issue") or {}
+    number = int(obj["number"])
+    kind = (
+        "pull request"
+        if "pull_request" in payload or bool((payload.get("issue") or {}).get("pull_request"))
+        else "issue"
+    )
+    marker = f"<!-- github-agent-router:handoff:v1 {repo}#{number} -->"
+    origin = extract_chatgpt_origin(str(obj.get("body") or ""))
+    source_url = (
+        str(obj.get("html_url") or "")
+        or f"https://github.com/{repo}/{'pull' if kind == 'pull request' else 'issues'}/{number}"
+    )
+    requests = verification.get("requests") or []
+    request_text = "\n".join(f"- {x}" for x in requests) if requests else "- None specified."
+    origin_text = origin.get("conversation", "Unavailable; create a fresh project-scoped handoff rather than guessing a conversation.")
+    agents_text = origin.get("agents_sha", "Unavailable; the local consumer must read the current applicable AGENTS.md before acting.")
+    body = f"""{marker}
+
+Source: {kind} #{number} — {source_url}
+Jules session: {state.url or state.session}
+Verification verdict: {verification.get('verdict')}
+Summary: {verification.get('summary')}
+
+Requested evidence or decision:
+{request_text}
+
+ChatGPT continuation:
+- conversation: {origin_text}
+- project: {origin.get('project', 'derive from the repository checkout')}
+- AGENTS.md provenance: {agents_text}
+
+Local consumer contract:
+1. Reconcile the checkout with `fleet sync --only {repo}`; do not use git-fleet as the reasoning agent.
+2. Read the current applicable local/repository AGENTS.md. If chatgpt-opencli maintains project Instructions, synchronize them before submitting the handoff; never copy private instruction text into this issue.
+3. Collect only the bounded evidence requested above, redact credentials/private payloads, and attach a concise result.
+4. If a canonical ChatGPT conversation URL is present, chatgpt-opencli may continue that conversation. Otherwise start a new repository-project handoff; never guess an original ChatGPT.com session.
+5. Return actionable evidence/fixes to the source PR. A `/jules ...` comment may resume the sticky Jules session after the branch/evidence is ready.
+
+This issue is a durable queue item, not authorization to bypass CI, branch protection, or user decisions."""
+    title = f"[agent handoff] {repo} #{number}: {verification.get('verdict')}"
+    return gh.ensure_handoff_issue(marker, title, body)
 
 
 def event_message(event_name: str, payload: dict[str, Any]) -> str:
@@ -229,6 +371,20 @@ def persist(gh: GitHubClient, number: int, state: RouteState) -> None:
         gh.add_labels(number, ["jules:needs-user"])
     else:
         gh.remove_label(number, "jules:needs-user")
+
+    if state.verification == "certified":
+        gh.add_labels(number, ["jules:certified"])
+        for label in ("jules:changes-required", "agent:blocked", "chatgpt:handoff"):
+            gh.remove_label(number, label)
+    elif state.verification == "changes_required":
+        gh.add_labels(number, ["jules:changes-required", "agent:blocked"])
+        gh.remove_label(number, "jules:certified")
+    elif state.verification in {"needs_evidence", "needs_user", "failed", "inconclusive"}:
+        gh.add_labels(number, ["agent:blocked"])
+        gh.remove_label(number, "jules:certified")
+
+    if state.handoff_issue:
+        gh.add_labels(number, ["chatgpt:handoff"])
 
 
 _LOCKS: dict[tuple[str, int], threading.Lock] = {}
@@ -257,7 +413,7 @@ def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
 def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
     repo = payload["repository"]["full_name"].lower()
     gh = GitHubClient(config.github_token, repo, dry_run=config.dry_run)
-    if event_name not in {"issues", "pull_request", "issue_comment"}:
+    if event_name not in {"issues", "pull_request", "issue_comment", "watch"}:
         return "ignored unsupported event"
     obj = payload.get("pull_request") or payload.get("issue") or {}
     number = int(obj["number"])
@@ -287,6 +443,9 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
         return "ignored command with mismatched author"
     if gh.can_write(sender) is not True:
         return "ignored event from actor without repository write permission"
+    if "pull_request" in payload and str((obj.get("head") or {}).get("ref", "")).startswith("chatgpt/") and not config.dry_run:
+        gh.add_labels(number, ["agent:chatgpt", "jules:run"])
+        labels.update({"agent:chatgpt", "jules:run"})
     comments = gh.comments(number)
     writers = {sender}
     for row in comments:
@@ -362,23 +521,114 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
         session = client.get_session(state.session)
         state.state = str(session.get("state", ""))
         state.url = str(session.get("url", state.url))
+        terminal_followup = False
         if command:
-            if state.state in TERMINAL_STATES or state.state not in ACTIVE_STATES | {"AWAITING_USER_FEEDBACK"}:
-                return "ignored command for terminal or unknown session state"
-        elif state.state in {"AWAITING_USER_FEEDBACK", "AWAITING_PLAN_APPROVAL"}:
-            state.needs_user = True
-            complete(state)
-            return f"{state.session} awaits user feedback"
-        elif state.state not in ACTIVE_STATES | TERMINAL_STATES:
-            state.needs_user = True
-            complete(state)
-            return "stopped on unknown session state; preserved owner and round"
-        elif state.state in TERMINAL_STATES:
-            if state.round >= config.max_rounds:
-                state.needs_user = True
+            if state.state in TERMINAL_STATES:
+                terminal_followup = state.verification in {
+                    "changes_required",
+                    "needs_evidence",
+                    "needs_user",
+                    "failed",
+                    "inconclusive",
+                }
+                if not terminal_followup:
+                    return "ignored command for terminal certified/unclassified session"
+            elif state.state not in ACTIVE_STATES | {"AWAITING_USER_FEEDBACK"}:
+                return "ignored command for unknown session state"
+        elif event_name == "watch" and state.state in ACTIVE_STATES:
+            return f"pending Jules verification: {state.state}"
+        elif state.state == "AWAITING_USER_FEEDBACK":
+            if state.feedback_nudges < 1:
+                state.feedback_nudges += 1
+                state.pending, state.operation = "send", uuid.uuid4().hex
+                state.operation_event = ident
+                save(state)
+                client.send_message(state.session, AUTONOMOUS_UNBLOCK_PROMPT)
+                state.needs_user = False
                 complete(state)
-                return f"stopped at max Jules rounds ({config.max_rounds})"
-        if command or state.state in ACTIVE_STATES:
+                return f"nudged {state.session} to classify the blocker before asking the user"
+            verification = extract_verification(client.list_activities(state.session)) or {
+                "verdict": "needs_user",
+                "summary": "Jules remained in AWAITING_USER_FEEDBACK after one bounded autonomous unblock attempt.",
+                "tests": [],
+                "red_team": [],
+                "requests": ["Review the Jules session and answer only the material decision it cannot infer."],
+            }
+            state.verification = "needs_user"
+            state.needs_user = True
+            state.handoff_issue = ensure_handoff(gh, payload, state, verification)
+            complete(state)
+            return f"needs user; surfaced in handoff issue #{state.handoff_issue}"
+        elif state.state == "AWAITING_PLAN_APPROVAL":
+            verification = {
+                "verdict": "needs_user",
+                "summary": "Jules unexpectedly requires plan approval although router sessions normally auto-approve plans.",
+                "tests": [],
+                "red_team": [],
+                "requests": ["Review/approve the Jules plan or correct the session configuration."],
+            }
+            state.verification = "needs_user"
+            state.needs_user = True
+            state.handoff_issue = ensure_handoff(gh, payload, state, verification)
+            complete(state)
+            return f"needs plan approval; surfaced in handoff issue #{state.handoff_issue}"
+        elif state.state not in ACTIVE_STATES | TERMINAL_STATES:
+            verification = {
+                "verdict": "needs_evidence",
+                "summary": f"Jules entered unknown state {state.state}.",
+                "tests": [],
+                "red_team": [],
+                "requests": ["Inspect the Jules session state and router logs; do not restart or transfer ownership blindly."],
+            }
+            state.verification = "inconclusive"
+            state.handoff_issue = ensure_handoff(gh, payload, state, verification)
+            complete(state)
+            return f"blocked on unknown Jules state; handoff issue #{state.handoff_issue}"
+        elif state.state in TERMINAL_STATES:
+            verification = None
+            if state.state == "COMPLETED":
+                try:
+                    verification = extract_verification(client.list_activities(state.session))
+                except ValueError as exc:
+                    verification = {
+                        "verdict": "needs_evidence",
+                        "summary": f"Jules returned a malformed certification record: {exc}",
+                        "tests": [],
+                        "red_team": [],
+                        "requests": ["Inspect the terminal Jules activity and produce a valid structured verification verdict."],
+                    }
+                    state.verification = "inconclusive"
+                    state.handoff_issue = ensure_handoff(gh, payload, state, verification)
+                    complete(state)
+                    return f"inconclusive verification; handoff issue #{state.handoff_issue}"
+                if verification:
+                    state.verification = str(verification["verdict"])
+                    if state.verification == "certified":
+                        state.needs_user = False
+                        state.handoff_issue = 0
+                        complete(state)
+                        return f"certified by Jules: {verification['summary']}"
+                    state.needs_user = state.verification == "needs_user"
+                    state.handoff_issue = ensure_handoff(gh, payload, state, verification)
+                    complete(state)
+                    if state.verification == "changes_required":
+                        return f"changes required; handoff issue #{state.handoff_issue}"
+                    if state.verification == "needs_evidence":
+                        return f"needs local evidence; handoff issue #{state.handoff_issue}"
+                    return f"needs user; surfaced in handoff issue #{state.handoff_issue}"
+            if state.round >= config.max_rounds:
+                verification = verification or {
+                    "verdict": "needs_evidence",
+                    "summary": f"Jules ended in {state.state} without a valid certification after {state.round} round(s).",
+                    "tests": [],
+                    "red_team": [],
+                    "requests": ["Inspect Jules terminal activities and the source PR; determine whether to repair or re-run verification."],
+                }
+                state.verification = "failed" if state.state != "COMPLETED" else "inconclusive"
+                state.handoff_issue = ensure_handoff(gh, payload, state, verification)
+                complete(state)
+                return f"verification blocked at max rounds; handoff issue #{state.handoff_issue}"
+        if (command and not terminal_followup) or state.state in ACTIVE_STATES:
             state.pending, state.operation = "send", uuid.uuid4().hex
             state.operation_event = ident
             save(state)
@@ -386,7 +636,31 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
             state.needs_user = False
             complete(state)
             return f"sent message to {state.session}" if command else f"continued active sticky session {state.session}"
-    title, prompt, branch, _, _ = build_prompt(payload)
+    if state and command and state.state in TERMINAL_STATES and state.verification in {
+        "changes_required",
+        "needs_evidence",
+        "needs_user",
+        "failed",
+        "inconclusive",
+    }:
+        title = f"Evidence follow-up #{number}"[:120]
+        branch = state.branch or payload["repository"].get("default_branch") or "main"
+        prompt = (
+            "Continue the independent verification of the same source work. "
+            "The previous Jules round is terminal, so this is a new sticky round owned by "
+            f"Jules {state.owner.upper()}.\n\n"
+            "New evidence or decision from the durable handoff:\n"
+            f"{prompt}\n\n"
+            "Re-inspect the current branch, rerun only the checks needed to evaluate this "
+            "new evidence, and finish with the required github-agent-router verification marker. "
+            "Do not certify based solely on the handoff text."
+        )
+    else:
+        title, prompt, branch, _, _ = build_prompt(payload)
+        if state and state.state == "COMPLETED":
+            prompt += "\n\nThe previous round completed without a valid verification marker. Re-check the current branch and finish with the required structured verdict."
+        elif state and state.state in {"FAILED", "CANCELLED", "CANCELED"}:
+            prompt += f"\n\nThe previous verification round ended in {state.state}. Re-run only the necessary verification and produce the required structured verdict."
     next_round = state.round + 1 if state else 1
     repo_owner, repo_name = repo.split("/", 1)
     client = JulesClient(config.jules_keys[owner])
@@ -413,6 +687,52 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
     new.url = str(session.get("url", ""))
     complete(new)
     return f"created sticky follow-up {new.session}" if state else f"created {new.session} on Jules {new.owner}"
+
+
+def watch_event(
+    config: Config,
+    event_name: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 1800,
+    interval: float = 30,
+) -> str:
+    """Boundedly wait for a routed PR to reach a certified or explicit blocked verdict."""
+    if event_name == "pull_request":
+        if not should_route_pr(payload.get("pull_request") or {}, config):
+            return "verification watch not required for an unrouted PR"
+    elif event_name == "issue_comment":
+        issue = payload.get("issue") or {}
+        body = str((payload.get("comment") or {}).get("body", ""))
+        if not issue.get("pull_request") or not re.match(r"^/jules(?:\s*:\s*|\s+|$)", body):
+            return "verification watch not applicable to this comment"
+        labels = label_names(issue)
+        if "jules:run" not in labels and not owner_from_labels(labels):
+            return "verification watch not required for an unrouted PR comment"
+    else:
+        return "verification watch not applicable to this event"
+    deadline = time.monotonic() + max(0.0, timeout)
+    attempt = 0
+    while True:
+        probe = json.loads(json.dumps(payload))
+        probe["action"] = f"watch-{attempt}"
+        result = route(config, "watch", probe)
+        if result.startswith("certified by Jules:"):
+            return result
+        if result.startswith((
+            "changes required;",
+            "needs local evidence;",
+            "needs user;",
+            "needs plan approval;",
+            "blocked on unknown Jules state;",
+            "inconclusive verification;",
+            "verification blocked at max rounds;",
+        )):
+            raise RuntimeError(result)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Jules certification did not settle within {timeout:g}s; last state: {result}")
+        attempt += 1
+        time.sleep(max(0.1, interval))
 
 
 def load_event() -> tuple[str, dict[str, Any]]:
