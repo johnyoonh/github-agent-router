@@ -54,6 +54,7 @@ jobs:
       allowed_owners: "{','.join(policy.allowed_owners)}"
       max_rounds: {policy.max_rounds}
       auto_review_prs: {str(policy.auto_review_prs).lower()}
+      verification_timeout: 1800
     secrets:
 ''' + "\n".join(secrets) + "\n"
 
