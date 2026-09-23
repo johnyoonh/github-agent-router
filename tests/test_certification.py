@@ -192,6 +192,59 @@ class CertificationContractTests(unittest.TestCase):
         self.assertEqual(result, "needs user; surfaced in handoff issue #91")
         gh.add_labels.assert_any_call(5, ["jules:needs-user"])
 
+    @patch("github_agent_router.router.GitHubClient")
+    @patch("github_agent_router.router.JulesClient")
+    def test_terminal_needs_evidence_comment_starts_new_sticky_round(self, jules_cls, gh_cls):
+        gh = gh_cls.return_value
+        gh.can_write.return_value = True
+        gh.add_comment.return_value = {"id": 11}
+        state = RouteState(
+            "a",
+            "sessions/s1",
+            round=1,
+            state="COMPLETED",
+            branch="chatgpt/implement-behavior",
+            verification="needs_evidence",
+            handoff_issue=88,
+        )
+        gh.comments.return_value = [signed_comment(state)]
+        jules = jules_cls.return_value
+        jules.get_session.return_value = {"state": "COMPLETED"}
+        jules.find_source.return_value = "sources/owner/repo"
+        jules.create_session.return_value = {
+            "name": "sessions/s2",
+            "state": "IN_PROGRESS",
+            "url": "https://jules.google/s2",
+        }
+        payload = {
+            "action": "created",
+            "sender": {"login": "maintainer"},
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "issue": {
+                "number": 5,
+                "title": "Implement behavior",
+                "body": "PR body",
+                "labels": [
+                    {"name": "jules:run"},
+                    {"name": "jules-owner:a"},
+                    {"name": "chatgpt:handoff"},
+                ],
+            },
+            "comment": {
+                "body": "/jules Local daemon trace is clean; exit 0 and expected socket is listening.",
+                "user": {"login": "maintainer"},
+            },
+        }
+
+        result = route(cfg(), "issue_comment", payload)
+
+        self.assertIn("created sticky follow-up sessions/s2", result)
+        jules.send_message.assert_not_called()
+        kwargs = jules.create_session.call_args.kwargs
+        self.assertEqual(kwargs["branch"], "chatgpt/implement-behavior")
+        self.assertIn("Local daemon trace is clean", kwargs["prompt"])
+        self.assertIn("required github-agent-router verification marker", kwargs["prompt"])
+
     def test_handoff_issue_reuses_existing_marker(self):
         gh = GitHubClient("token", "owner/repo")
         marker_text = "<!-- github-agent-router:handoff:v1 owner/repo#5 -->"
