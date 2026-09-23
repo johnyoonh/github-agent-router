@@ -82,7 +82,7 @@ jobs:
           JULES_B_API_KEY: ${{ secrets.jules_b_api_key }}
         run: github-agent-router
       - name: Await Jules certification
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/jules'))
         env:
           GITHUB_TOKEN: ${{ github.token }}
           AGENT_ROUTER_SERIALIZED: "true"
