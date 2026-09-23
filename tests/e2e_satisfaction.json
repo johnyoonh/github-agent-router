@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "purpose": "Credentialed end-to-end acceptance criteria for ChatGPT PR -> Jules verification -> merge gate -> local/ChatGPT handoff.",
+  "scenarios": [
+    {
+      "id": "chatgpt_pr_ingress",
+      "live_required": true,
+      "setup": "Create a PR from a same-repository chatgpt/<slug> branch with a behavioral requirement and at least one changed implementation file.",
+      "expected": [
+        "router adds agent:chatgpt and jules:run",
+        "exactly one sticky Jules session is created",
+        "session prompt names the PR head SHA and requires behavioral plus adversarial evidence"
+      ],
+      "required_evidence": [
+        "PR URL",
+        "PR labels",
+        "Jules session URL",
+        "router state comment"
+      ]
+    },
+    {
+      "id": "certified_happy_path",
+      "live_required": true,
+      "setup": "Use an implementation that satisfies the stated behavior and has remotely runnable checks.",
+      "expected": [
+        "Jules runs or adds focused behavioral tests",
+        "Jules performs at least one relevant red-team/adversarial probe",
+        "terminal agent message contains a valid certified verification marker",
+        "source PR receives jules:certified and has no agent:blocked/chatgpt:handoff labels",
+        "Jules certification workflow check succeeds"
+      ],
+      "required_evidence": [
+        "Jules activity marker",
+        "test command/result evidence",
+        "red-team case/result",
+        "successful GitHub check"
+      ]
+    },
+    {
+      "id": "verified_shortcoming_loop",
+      "live_required": true,
+      "setup": "Seed a deterministic behavioral defect not caught by the original PR tests.",
+      "expected": [
+        "Jules demonstrates the defect with a focused failing test or equivalent reproducible evidence",
+        "verdict is changes_required rather than certified",
+        "source PR receives jules:changes-required and agent:blocked",
+        "one deduplicated chatgpt:handoff issue is created",
+        "after the ChatGPT branch is repaired and synchronized, a new verification event can eventually certify the updated head"
+      ],
+      "required_evidence": [
+        "failing behavioral test before repair",
+        "handoff issue URL",
+        "repair commit SHA",
+        "later certified marker"
+      ]
+    },
+    {
+      "id": "local_evidence_handoff",
+      "live_required": true,
+      "setup": "Use a case whose decisive evidence exists only on the Mac or in bounded local logs.",
+      "expected": [
+        "Jules returns needs_evidence with exact bounded requests instead of waiting indefinitely",
+        "one chatgpt:handoff issue records the requests without secrets/private payloads",
+        "local consumer first runs fleet sync --only owner/repo",
+        "local consumer reads current AGENTS.md and synchronizes project Instructions through chatgpt-opencli before handoff when that capability is enabled",
+        "known canonical ChatGPT conversation is continued when provenance exists; otherwise a fresh project-scoped handoff is used",
+        "collected evidence or repair is returned to the source PR and Jules can resume"
+      ],
+      "required_evidence": [
+        "handoff issue URL",
+        "git-fleet reconciliation output",
+        "redacted local evidence",
+        "ChatGPT conversation URL or explicit fresh-handoff record",
+        "subsequent Jules result"
+      ]
+    },
+    {
+      "id": "material_user_block",
+      "live_required": true,
+      "setup": "Present a genuinely material product/security/data-loss choice with no safe inferred answer.",
+      "expected": [
+        "router permits one autonomous unblock nudge before surfacing the question",
+        "Jules remains sticky to the same account/session",
+        "source PR receives jules:needs-user and agent:blocked",
+        "handoff issue contains the exact material question",
+        "no automatic merge or owner transfer occurs"
+      ],
+      "required_evidence": [
+        "Jules message before nudge",
+        "router state feedback_nudges=1",
+        "handoff issue",
+        "source labels"
+      ]
+    },
+    {
+      "id": "replay_and_duplicate_safety",
+      "live_required": false,
+      "setup": "Replay identical GitHub events, retry after label failure, and re-run handoff creation.",
+      "expected": [
+        "no duplicate Jules session is created",
+        "no duplicate handoff issue is created",
+        "signed router state remains bound to repository, issue, comment and sticky owner",
+        "uncertain external sends are not blindly replayed"
+      ],
+      "required_evidence": [
+        "unit/state-recovery test results"
+      ]
+    },
+    {
+      "id": "agents_instruction_provenance",
+      "live_required": true,
+      "setup": "Change applicable AGENTS.md after an earlier ChatGPT project handoff, then trigger a new local handoff.",
+      "expected": [
+        "chatgpt-opencli detects current applicable AGENTS.md",
+        "project Instructions are synchronized before the new prompt is submitted",
+        "handoff provenance may record an AGENTS content hash but never copies private instruction text into GitHub",
+        "ChatGPT response follows the updated instruction contract"
+      ],
+      "required_evidence": [
+        "AGENTS.md commit/hash",
+        "project-instructions sync evidence",
+        "new ChatGPT conversation turn evidence"
+      ]
+    }
+  ]
+}
