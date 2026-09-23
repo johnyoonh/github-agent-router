@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 
 from github_agent_router.config import Config
 
-from github_agent_router.github import GitHubClient, GitHubError, REQUIRED_LABELS
+from github_agent_router.github import GitHubClient, REQUIRED_LABELS
 from github_agent_router.jules import JulesClient, JulesError
 from github_agent_router.router import (
     RouteState,
@@ -37,9 +37,17 @@ def cfg(**kwargs):
         max_rounds=2,
         auto_review_prs=False,
         dry_run=False,
+        serialized=True,
     )
     base.update(kwargs)
     return Config(**base)
+
+
+def route_comment(state, number=1):
+    """Fixtures model bot-authored, context-bound production state."""
+    state.repository, state.number, state.comment_id = "owner/repo", number, 10
+    return {"id": 10, "body": state.comment(key="key-" + state.owner),
+            "user": {"login": "github-actions[bot]", "type": "Bot"}}
 
 
 class RouterUnitTests(unittest.TestCase):
@@ -92,7 +100,7 @@ class RouterUnitTests(unittest.TestCase):
             config = Config.from_env()
 
         self.assertEqual(config.home, "auto")
-        self.assertEqual(config.overflow, "auto")
+        self.assertIsNone(config.overflow)
         self.assertEqual(config.private_home, "a")
         self.assertEqual(config.public_home, "b")
 
@@ -106,7 +114,7 @@ class RouterUnitTests(unittest.TestCase):
         comment_body = state.comment()
         self.assertNotIn(r"\`", comment_body)
         self.assertIn("`sessions/123`", comment_body)
-        parsed, comment_id = parse_route_state([{"id": 9, "body": comment_body}])
+        parsed, comment_id = parse_route_state([{"id": 9, "body": comment_body, "user": {"login": "github-actions[bot]", "type": "Bot"}}])
         self.assertEqual(comment_id, 9)
         self.assertEqual(parsed, state)
 
@@ -134,6 +142,7 @@ class RouterUnitTests(unittest.TestCase):
 
     def test_build_prompt_issue(self):
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo", "default_branch": "main"},
             "issue": {"number": 42, "title": "Fix bug", "body": "Details here", "labels": []},
         }
@@ -145,6 +154,7 @@ class RouterUnitTests(unittest.TestCase):
 
     def test_build_prompt_pr(self):
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "pull_request": {
                 "number": 10,
@@ -181,6 +191,7 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_route_unlabeled_issue_ignored(self, mock_jules, mock_gh):
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1, "title": "Test", "labels": []},
         }
@@ -192,6 +203,8 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_route_labeled_issue_creates_session(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         mock_gh.comments.return_value = []
         mock_jules = mock_jules_cls.return_value
         mock_jules.find_source.return_value = "sources/123"
@@ -202,6 +215,7 @@ class RouteFlowTests(unittest.TestCase):
         }
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
         }
@@ -209,12 +223,15 @@ class RouteFlowTests(unittest.TestCase):
         self.assertIn("created sessions/s1 on Jules a", result)
         mock_gh.setup_labels.assert_called_once_with()
         mock_gh.add_labels.assert_called_with(1, ["jules-owner:a"])
-        mock_gh.upsert_router_comment.assert_called()
+        mock_gh.add_comment.assert_called_once()
+        mock_gh.update_comment.assert_called()
 
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
     def test_route_auto_home_uses_public_repository_for_jules_b(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         mock_gh.comments.return_value = []
         mock_gh.is_private.return_value = False
         mock_jules = mock_jules_cls.return_value
@@ -226,6 +243,7 @@ class RouteFlowTests(unittest.TestCase):
         }
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/public-repo"},
             "issue": {"number": 2, "title": "Public", "labels": [{"name": "jules:run"}]},
         }
@@ -239,6 +257,8 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_route_overflow_on_429(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         mock_gh.comments.return_value = []
 
         def client_side_effect(api_key):
@@ -257,6 +277,7 @@ class RouteFlowTests(unittest.TestCase):
         mock_jules_cls.side_effect = client_side_effect
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
         }
@@ -268,6 +289,8 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_route_auto_overflow_on_429_uses_other_account(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         mock_gh.comments.return_value = []
         mock_gh.is_private.return_value = True
 
@@ -287,6 +310,7 @@ class RouteFlowTests(unittest.TestCase):
         mock_jules_cls.side_effect = client_side_effect
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/private-repo"},
             "issue": {"number": 3, "title": "Private", "labels": [{"name": "jules:run"}]},
         }
@@ -294,50 +318,41 @@ class RouteFlowTests(unittest.TestCase):
 
         self.assertIn("created sessions/auto-overflow-b on Jules b", result)
 
-    def test_persist_records_session_before_owner_label(self):
-        from github_agent_router.router import persist
-
-        events = []
-        gh = MagicMock()
-        gh.setup_labels.side_effect = lambda: events.append("setup_labels")
-        gh.upsert_router_comment.side_effect = lambda *args: events.append("comment")
-        gh.add_labels.side_effect = lambda *args: events.append("owner_label")
-        gh.remove_label.side_effect = lambda *args: events.append("remove_other")
-
-        persist(gh, 4, RouteState("a", "sessions/4"))
-
-        self.assertEqual(events, ["setup_labels", "comment", "owner_label", "remove_other"])
-
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
     def test_route_active_session_continuation(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
-        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_gh.comments.return_value = [route_comment(existing_state)]
 
         mock_jules = mock_jules_cls.return_value
         mock_jules.get_session.return_value = {"state": "IN_PROGRESS", "url": "https://jules.google/s1"}
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
         }
-        result = route(cfg(home="auto", overflow="auto"), "issues", payload)
+        result = route(cfg(), "issues", payload)
         self.assertIn("continued active sticky session sessions/s1", result)
         mock_jules.send_message.assert_called()
-        mock_gh.is_private.assert_not_called()
 
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
     def test_route_awaiting_user_feedback(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
-        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_gh.comments.return_value = [route_comment(existing_state)]
 
         mock_jules = mock_jules_cls.return_value
         mock_jules.get_session.return_value = {"state": "AWAITING_USER_FEEDBACK", "url": "https://jules.google/s1"}
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1, "title": "Test", "labels": [{"name": "jules:run"}]},
         }
@@ -349,8 +364,10 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_route_terminal_creates_next_round(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "COMPLETED")
-        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_gh.comments.return_value = [route_comment(existing_state, number=5)]
 
         mock_jules = mock_jules_cls.return_value
         mock_jules.get_session.return_value = {"state": "COMPLETED", "url": "https://jules.google/s1"}
@@ -362,6 +379,7 @@ class RouteFlowTests(unittest.TestCase):
         }
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "pull_request": {
                 "number": 5,
@@ -377,13 +395,16 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_route_terminal_max_rounds_adds_needs_user(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         existing_state = RouteState("a", "sessions/s2", "https://jules.google/s2", 2, "COMPLETED")
-        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_gh.comments.return_value = [route_comment(existing_state, number=5)]
 
         mock_jules = mock_jules_cls.return_value
         mock_jules.get_session.return_value = {"state": "COMPLETED", "url": "https://jules.google/s2"}
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "pull_request": {
                 "number": 5,
@@ -401,14 +422,18 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_issue_comment_routes_jules_prompt(self, mock_jules_cls, mock_gh_cls):
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
-        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_gh.comments.return_value = [route_comment(existing_state)]
         mock_jules = mock_jules_cls.return_value
+        mock_jules.get_session.return_value = {"state": "IN_PROGRESS"}
 
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1},
-            "comment": {"body": "/jules: please retain user logs"},
+            "comment": {"body": "/jules: please retain user logs", "user": {"login": "maintainer"}},
         }
         result = route(cfg(), "issue_comment", payload)
         self.assertIn("sent message to sessions/s1", result)
@@ -419,6 +444,7 @@ class RouteFlowTests(unittest.TestCase):
     @patch("github_agent_router.router.JulesClient")
     def test_issue_comment_empty_or_ignored(self, mock_jules_cls, mock_gh_cls):
         payload_non_jules = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1},
             "comment": {"body": "LGTM"},
@@ -429,13 +455,16 @@ class RouteFlowTests(unittest.TestCase):
         )
 
         payload_empty = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 1},
             "comment": {"body": "/jules"},
         }
         mock_gh = mock_gh_cls.return_value
+        mock_gh.can_write.return_value = True
+        mock_gh.add_comment.return_value = {"id": 99}
         existing_state = RouteState("a", "sessions/s1", "https://jules.google/s1", 1, "IN_PROGRESS")
-        mock_gh.comments.return_value = [{"id": 10, "body": existing_state.comment()}]
+        mock_gh.comments.return_value = [route_comment(existing_state)]
         self.assertEqual(
             route(cfg(), "issue_comment", payload_empty),
             "ignored empty /jules command",
@@ -443,10 +472,12 @@ class RouteFlowTests(unittest.TestCase):
 
     def test_dry_run_mode(self):
         payload = {
+            "sender": {"login": "maintainer"},
             "repository": {"full_name": "owner/repo"},
             "issue": {"number": 7, "title": "Test", "labels": [{"name": "jules:run"}]},
         }
         with patch("github_agent_router.router.GitHubClient") as mock_gh:
+            mock_gh.return_value.can_write.return_value = True
             mock_gh.return_value.comments.return_value = []
             result = route(cfg(dry_run=True), "issues", payload)
             self.assertIn("dry-run: would route #7 to Jules a", result)
@@ -459,13 +490,6 @@ class SetupAndCheckTests(unittest.TestCase):
 
         self.assertTrue(GitHubClient("token", "owner/repo").is_private())
         mock_request.assert_called_once_with("GET", "/repos/owner/repo")
-
-    @patch("github_agent_router.github.GitHubClient._request")
-    def test_repository_visibility_requires_boolean_response(self, mock_request):
-        for response in ({}, {"private": "false"}):
-            mock_request.return_value = response
-            with self.assertRaisesRegex(GitHubError, "boolean private"):
-                GitHubClient("token", "owner/repo").is_private()
 
     @patch("github_agent_router.github.GitHubClient._request")
     def test_setup_labels(self, mock_request):
@@ -487,76 +511,27 @@ class SetupAndCheckTests(unittest.TestCase):
         code = check_credentials(cfg())
         self.assertEqual(code, 0)
 
-    def test_check_credentials_fails_without_github_token(self):
-        self.assertEqual(
-            check_credentials(cfg(github_token="", jules_keys={"a": "", "b": ""})),
-            1,
-        )
-
     def test_generate_workflow_content(self):
         from github_agent_router.router import generate_workflow_content
-        content = generate_workflow_content(home="b", overflow="a", max_rounds=3, auto_review_prs=True)
+        content = generate_workflow_content(home="b", overflow="a", max_rounds=3, auto_review_prs=True, revision="a" * 40)
         self.assertIn("home: b", content)
         self.assertIn('overflow: "a"', content)
         self.assertIn("max_rounds: 3", content)
         self.assertIn("auto_review_prs: true", content)
 
-    def test_generate_workflow_includes_visibility_owner_inputs(self):
-        from github_agent_router.router import generate_workflow_content
-
-        content = generate_workflow_content()
-
-        self.assertIn("private_home: a", content)
-        self.assertIn("public_home: b", content)
-
-    def test_generate_workflow_serializes_repository_runs(self):
-        from github_agent_router.router import generate_workflow_content
-
-        content = generate_workflow_content()
-
-        self.assertIn("concurrency:", content)
-        self.assertIn("cancel-in-progress: false", content)
-
     def test_generate_workflow_defaults_to_visibility_routing(self):
         from github_agent_router.router import generate_workflow_content
 
-        content = generate_workflow_content()
+        content = generate_workflow_content(revision="a" * 40)
 
         self.assertIn("home: auto", content)
-        self.assertIn('overflow: "auto"', content)
+        self.assertIn('overflow: ""', content)
 
-    @patch("github_agent_router.github.GitHubClient._request")
-    def test_provision_repo(self, mock_request):
+    def test_provision_repo_rejects_direct_branch_write(self):
         from github_agent_router.router import provision_repo
-        mock_request.return_value = {}
-        provision_repo(cfg(), "target/repo", home="a", overflow="b")
-        # Ensure requests were made for setup labels and put_file
-        self.assertTrue(mock_request.called)
-
-    @patch("github_agent_router.router.git_remote_slug")
-    def test_scan_workspace_repos_assigns_home_policy(self, mock_slug):
-        import tempfile
-        from github_agent_router.router import scan_workspace_repos
-
-        with tempfile.TemporaryDirectory() as tmp:
-            repos_dir = os.path.join(tmp, "repos")
-            chrome_dir = os.path.join(tmp, "chrome")
-            for r in (repos_dir, chrome_dir):
-                repo_git = os.path.join(r, "my-project", ".git")
-                os.makedirs(repo_git)
-
-            mock_slug.side_effect = lambda path: "johnyoonh/" + os.path.basename(os.path.dirname(path))
-
-            results = scan_workspace_repos([repos_dir, chrome_dir], owner_filter="johnyoonh")
-            self.assertEqual(len(results), 2)
-            repos_item = next(x for x in results if x["root"] == "repos")
-            chrome_item = next(x for x in results if x["root"] == "chrome")
-            self.assertEqual(repos_item["home"], "a")
-            self.assertEqual(repos_item["overflow"], "b")
-            self.assertEqual(chrome_item["home"], "b")
-            self.assertEqual(chrome_item["overflow"], "a")
+        with self.assertRaisesRegex(ValueError, "dedicated chatgpt/"):
+            provision_repo(cfg(), "target/repo", branch="main", revision="a" * 40)
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,27 +1,10 @@
-name: Jules Router
-
-on:
-  issues:
-    types: [opened, edited, labeled, reopened]
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  issue_comment:
-    types: [created]
-
-concurrency:
-  group: jules-router-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: false
-
-jobs:
-  jules:
-    uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
-    with:
-      home: auto
-      overflow: auto
-      private_home: a
-      public_home: b
-      max_rounds: 2
-      auto_review_prs: false
-    secrets:
-      jules_a_api_key: ${{ secrets.JULES_A_API_KEY }}
-      jules_b_api_key: ${{ secrets.JULES_B_API_KEY }}
+# Historical copy-and-paste workflows are intentionally retired in 0.2.
+# Generate a complete, policy-specific workflow with both references pinned:
+#
+# github-agent-router provision OWNER/REPO --policy POLICY_JSON \
+#   --router-ref REVIEWED_FULL_COMMIT_SHA --dry-run
+#
+# Then rerun without --dry-run after credentials and source access are verified.
+# The provisioner opens/reuses a chatgpt/ PR; it does not write the default branch.
+# Public targets require an approved public-safe distribution before activation.
+# See docs/OPERATIONS.md. This comment-only file is not an installable workflow.

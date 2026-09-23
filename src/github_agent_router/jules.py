@@ -32,8 +32,7 @@ class JulesClient:
             with request.urlopen(req, timeout=30) as response:
                 raw = response.read()
         except error.HTTPError as exc:
-            raw = exc.read().decode(errors="replace")
-            raise JulesError(exc.code, raw) from exc
+            raise JulesError(exc.code, "request failed") from exc
         if not raw:
             return {}
         return json.loads(raw)
@@ -106,3 +105,18 @@ class JulesClient:
             token = data.get("nextPageToken", "")
             if not token:
                 return activities
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        sessions: list[dict[str, Any]] = []
+        token = ""
+        seen: set[str] = set()
+        while True:
+            query = "?pageSize=100" + ("&pageToken=" + parse.quote(token, safe="") if token else "")
+            data = self._request("GET", "/sessions" + query)
+            sessions.extend(data.get("sessions", []))
+            token = data.get("nextPageToken", "")
+            if not token:
+                return sessions
+            if token in seen:
+                raise ValueError("repeated Jules pagination token")
+            seen.add(token)

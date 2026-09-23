@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Any
 from urllib import error, parse, request
 
@@ -20,18 +21,24 @@ REQUIRED_LABELS: list[tuple[str, str, str]] = [
 
 
 class GitHubError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 class GitHubClient:
-    def __init__(self, token: str, repository: str):
-        if "/" not in repository:
+    def __init__(self, token: str, repository: str, *, dry_run: bool = False):
+        if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError("repository must be owner/name")
         self.token = token
         self.repository = repository
         self.owner, self.repo = repository.split("/", 1)
+        self.dry_run = dry_run
+        self._labels: set[str] = set()
 
     def _request(self, method: str, path: str, payload: Any | None = None) -> Any:
+        if self.dry_run and method != "GET":
+            raise ValueError("dry-run forbids GitHub writes")
         body = None
         headers = {
             "Accept": "application/vnd.github+json",
@@ -47,8 +54,8 @@ class GitHubClient:
             with request.urlopen(req, timeout=30) as response:
                 raw = response.read()
         except error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise GitHubError(f"GitHub API {exc.code}: {detail}") from exc
+            # Never include a response body that may echo credentials or private data.
+            raise GitHubError(f"GitHub API {exc.code}", exc.code) from exc
         if not raw:
             return {}
         return json.loads(raw)
@@ -57,14 +64,36 @@ class GitHubClient:
         return self._request("GET", f"/repos/{self.owner}/{self.repo}")
 
     def is_private(self) -> bool:
-        private = self.get_repo().get("private")
-        if not isinstance(private, bool):
-            raise GitHubError("GitHub API response missing boolean private field")
-        return private
+        value = self.get_repo().get("private")
+        if not isinstance(value, bool):
+            raise ValueError("repository visibility is unavailable")
+        return value
+
+    def paginated(self, path: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        separator = "&" if "?" in path else "?"
+        for page in range(1, 10001):
+            batch = self._request("GET", f"{path}{separator}per_page=100&page={page}")
+            if not isinstance(batch, list):
+                raise GitHubError("expected a paginated list")
+            rows.extend(batch)
+            if len(batch) < 100:
+                return rows
+        raise GitHubError("pagination limit exceeded; refusing incomplete state")
 
     def comments(self, number: int) -> list[dict[str, Any]]:
-        return self._request("GET", f"/repos/{self.owner}/{self.repo}/issues/{number}/comments?per_page=100")
+        return self.paginated(f"/repos/{self.repository}/issues/{number}/comments")
 
+    def can_write(self, login: str) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", login):
+            return False
+        try:
+            data = self._request("GET", f"/repos/{self.repository}/collaborators/{parse.quote(login, safe='')}/permission")
+        except GitHubError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return data.get("permission") in {"write", "admin"}
 
     def add_comment(self, number: int, body: str) -> dict[str, Any]:
         return self._request("POST", f"/repos/{self.owner}/{self.repo}/issues/{number}/comments", {"body": body})
@@ -73,16 +102,31 @@ class GitHubClient:
         return self._request("PATCH", f"/repos/{self.owner}/{self.repo}/issues/comments/{comment_id}", {"body": body})
 
     def ensure_label(self, name: str, color: str = "6f42c1", description: str = "") -> None:
-        encoded = parse.quote(name, safe="")
-        payload: dict[str, str] = {"name": name, "color": color}
-        if description:
-            payload["description"] = description
+        if name in self._labels:
+            return
+        for known, standard_color, standard_description in REQUIRED_LABELS:
+            if known == name:
+                color, description = standard_color, standard_description
+                break
+        path = f"/repos/{self.repository}/labels/{parse.quote(name, safe='')}"
+        desired = {"name": name, "color": color, "description": description}
         try:
-            self._request("GET", f"/repos/{self.owner}/{self.repo}/labels/{encoded}")
+            existing = self._request("GET", path)
         except GitHubError as exc:
-            if "404" not in str(exc):
+            if exc.status != 404:
                 raise
-            self._request("POST", f"/repos/{self.owner}/{self.repo}/labels", payload)
+            try:
+                self._request("POST", f"/repos/{self.repository}/labels", desired)
+            except GitHubError as create_error:
+                if create_error.status != 422:
+                    raise
+                # A concurrent creator is possible, but 422 alone is not evidence of success.
+                existing = self._request("GET", path)
+            else:
+                existing = desired
+        if any((str(existing.get(k) or "").lower() if k == "color" else existing.get(k)) != v for k, v in desired.items()):
+            self._request("PATCH", path, {"new_name": name, "color": color, "description": description})
+        self._labels.add(name)
 
     def setup_labels(self) -> list[str]:
         ensured = []
@@ -102,12 +146,12 @@ class GitHubClient:
         try:
             self._request("DELETE", f"/repos/{self.owner}/{self.repo}/issues/{number}/labels/{encoded}")
         except GitHubError as exc:
-            if "404" not in str(exc):
+            if exc.status != 404:
                 raise
 
     def upsert_router_comment(self, number: int, marker_prefix: str, body: str) -> None:
-        for comment in self.comments(number):
-            if marker_prefix in (comment.get("body") or ""):
+        for comment in reversed(self.comments(number)):
+            if (comment.get("user") or {}).get("login") == "github-actions[bot]" and marker_prefix in (comment.get("body") or ""):
                 self.update_comment(int(comment["id"]), body)
                 return
         self.add_comment(number, body)
@@ -117,7 +161,7 @@ class GitHubClient:
         try:
             return self._request("GET", f"/repos/{self.owner}/{self.repo}/contents/{path}{query}")
         except GitHubError as exc:
-            if "404" in str(exc):
+            if exc.status == 404:
                 return None
             raise
 
@@ -129,6 +173,8 @@ class GitHubClient:
         branch: str | None = None,
     ) -> dict[str, Any]:
         existing = self.get_file(path, ref=branch)
+        if existing and base64.b64decode(existing.get("content", "")).decode("utf-8") == content:
+            return {"unchanged": True, "content": existing}
         payload: dict[str, Any] = {
             "message": message,
             "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),

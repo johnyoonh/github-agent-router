@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import threading
+import uuid
 import os
 import re
-import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
-
 
 from .config import Config
 from .github import GitHubClient
@@ -27,15 +29,21 @@ class RouteState:
     url: str = ""
     round: int = 1
     state: str = ""
+    repository: str = ""
+    number: int = 0
+    events: list[str] = field(default_factory=list)
+    pending: str = ""
+    operation: str = ""
+    source: str = ""
+    branch: str = ""
+    operation_event: str = ""
+    comment_id: int = 0
+    needs_user: bool = False
 
-    def comment(self) -> str:
-        meta = {
-            "owner": self.owner,
-            "session": self.session,
-            "url": self.url,
-            "round": self.round,
-            "state": self.state,
-        }
+    def comment(self, *, key: str = "") -> str:
+        meta = asdict(self)
+        if key:
+            meta["signature"] = state_signature(meta, key)
         lines = [
             f"Jules owner: **{self.owner.upper()}**",
             f"Session: `{self.session}`",
@@ -57,10 +65,10 @@ def label_names(obj: dict[str, Any]) -> set[str]:
 
 
 def owner_from_labels(labels: set[str]) -> str | None:
-    for owner in ("a", "b"):
-        if f"jules-owner:{owner}" in labels:
-            return owner
-    return None
+    owners = [owner for owner in ("a", "b") if f"jules-owner:{owner}" in labels]
+    if len(owners) > 1:
+        raise ValueError("conflicting Jules owner labels; reconcile ownership")
+    return owners[0] if owners else None
 
 
 def preferred_home(config: Config, repository_private: bool | None = None) -> str:
@@ -105,23 +113,54 @@ def choose_owner(
     raise ValueError("no configured Jules API key is available")
 
 
-def parse_route_state(comments: list[dict[str, Any]]) -> tuple[RouteState | None, int | None]:
+def state_signature(meta: dict[str, Any], key: str) -> str:
+    derived = hmac.new(key.encode(), b"github-agent-router/state/v1", hashlib.sha256).digest()
+    return hmac.new(derived, json.dumps(meta, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+
+
+def parse_route_state(
+    comments: list[dict[str, Any]], *, repository: str | None = None,
+    number: int | None = None, keys: dict[str, str] | None = None,
+    trusted_logins: set[str] | None = None,
+) -> tuple[RouteState | None, int | None]:
+    """Read only bot-authored state; runtime additionally requires a bound signature.
+
+    Unsigned legacy bot state deliberately blocks creation instead of losing locality.
+    Key rotation or ambiguous state requires explicit reconciliation, never a new task.
+    """
     for comment in reversed(comments):
-        body = comment.get("body") or ""
-        match = MARKER_RE.search(body)
+        author = comment.get("user") or {}
+        bot = author.get("login") == "github-actions[bot]" and author.get("type") == "Bot"
+        if not bot and not (keys is not None and author.get("login") in (trusted_logins or set())):
+            continue
+        match = MARKER_RE.search(comment.get("body") or "")
         if not match:
             continue
         try:
             raw = json.loads(match.group(1))
-            return RouteState(
-                owner=str(raw["owner"]),
-                session=str(raw["session"]),
-                url=str(raw.get("url", "")),
-                round=int(raw.get("round", 1)),
-                state=str(raw.get("state", "")),
-            ), int(comment["id"])
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-            continue
+            signature = raw.pop("signature", "")
+            if keys is not None:
+                if raw.get("comment_id") and raw["comment_id"] != comment["id"]:
+                    continue  # A quote/replay is not the canonical record.
+                if raw.get("comment_id") != comment["id"]:
+                    raise ValueError("legacy state is not bound to its comment ID; reconcile it")
+                key = keys.get(raw.get("owner", ""), "")
+                if not key or not isinstance(signature, str) or not hmac.compare_digest(signature, state_signature(raw, key)):
+                    raise ValueError("unsigned or invalid state; reconcile legacy state or rotated keys")
+                if raw.get("repository") != repository or raw.get("number") != number:
+                    raise ValueError("router state belongs to a different repository or issue")
+            state = RouteState(**raw)
+            if state.owner not in {"a", "b"} or type(state.round) is not int or state.round < 1:
+                raise ValueError("invalid state owner or round")
+            if state.pending not in {"", "create", "send"}:
+                raise ValueError("invalid pending operation")
+            if not (state.pending == "create" and not state.session) and not re.fullmatch(r"sessions/[A-Za-z0-9_-]+", state.session):
+                raise ValueError("invalid session name")
+            if not isinstance(state.events, list) or any(not isinstance(e, str) for e in state.events) or len(state.events) > 256:
+                raise ValueError("invalid event history")
+            return state, int(comment["id"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("malformed bot-authored routing state; reconcile before continuing") from exc
     return None, None
 
 
@@ -181,148 +220,199 @@ def event_message(event_name: str, payload: dict[str, Any]) -> str:
 
 
 def persist(gh: GitHubClient, number: int, state: RouteState) -> None:
+    """Repair derived labels only, after the canonical signed state is durable."""
     gh.setup_labels()
-    gh.upsert_router_comment(number, MARKER_PREFIX, state.comment())
     gh.add_labels(number, [f"jules-owner:{state.owner}"])
     other = "b" if state.owner == "a" else "a"
     gh.remove_label(number, f"jules-owner:{other}")
+    if state.needs_user:
+        gh.add_labels(number, ["jules:needs-user"])
+    else:
+        gh.remove_label(number, "jules:needs-user")
 
 
-def create_for_owner(
-    *,
-    owner: str,
-    config: Config,
-    repo_full_name: str,
-    branch: str,
-    title: str,
-    prompt: str,
-    round_number: int,
-) -> RouteState:
-    client = JulesClient(config.jules_keys.get(owner, ""))
-    repo_owner, repo_name = repo_full_name.split("/", 1)
-    source = client.find_source(repo_owner, repo_name)
-    session = client.create_session(
-        source=source,
-        branch=branch,
-        title=title,
-        prompt=prompt,
-        auto_create_pr=True,
-    )
-    return RouteState(
-        owner=owner,
-        session=session["name"],
-        url=str(session.get("url", "")),
-        round=round_number,
-        state=str(session.get("state", "")),
-    )
+_LOCKS: dict[tuple[str, int], threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def event_id(event_name: str, payload: dict[str, Any]) -> str:
+    obj = payload.get("pull_request") or payload.get("issue") or {}
+    comment = payload.get("comment") or {}
+    relevant = [event_name, payload.get("action"), obj.get("number"), obj.get("title"),
+                obj.get("body"), obj.get("updated_at"), (obj.get("head") or {}).get("sha"),
+                comment.get("id"), comment.get("body")]
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
 
 
 def route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
-    repo_full_name = payload["repository"]["full_name"]
-    gh = GitHubClient(config.github_token, repo_full_name)
+    obj = payload.get("pull_request") or payload.get("issue") or {}
+    key = (payload["repository"]["full_name"].lower(), int(obj["number"]))
+    with _LOCKS_GUARD:
+        lock = _LOCKS.setdefault(key, threading.Lock())
+    # Local threads are serialized; cross-run serialization is the workflow's contract.
+    with lock:
+        return _route(config, event_name, payload)
 
-    if event_name == "issue_comment":
-        issue = payload.get("issue") or {}
-        number = int(issue["number"])
+
+def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
+    repo = payload["repository"]["full_name"].lower()
+    gh = GitHubClient(config.github_token, repo, dry_run=config.dry_run)
+    if event_name not in {"issues", "pull_request", "issue_comment"}:
+        return "ignored unsupported event"
+    obj = payload.get("pull_request") or payload.get("issue") or {}
+    number = int(obj["number"])
+    labels = label_names(obj)
+    command = event_name == "issue_comment"
+    if command:
         message = event_message(event_name, payload)
         if not re.match(r"^/jules(?:\s*:\s*|\s+|$)", message):
             return "ignored issue comment without /jules"
-        state, _ = parse_route_state(gh.comments(number))
-        if not state:
-            return "ignored /jules comment because no routed session exists"
-        if not config.jules_keys.get(state.owner):
-            raise ValueError(f"missing API key for sticky owner {state.owner}")
         prompt = re.sub(r"^/jules(?:\s*:\s*|\s+)?", "", message).strip()
         if not prompt:
             return "ignored empty /jules command"
-        JulesClient(config.jules_keys[state.owner]).send_message(state.session, prompt)
-        gh.remove_label(number, "jules:needs-user")
-        return f"sent message to {state.session}"
-
-    title, prompt, branch, number, labels = build_prompt(payload)
-
-    if "pull_request" in payload and not should_route_pr(payload["pull_request"], config):
+    elif "pull_request" in payload and not should_route_pr(obj, config):
         return "ignored PR: auto review disabled and jules:run absent"
-
-    if "pull_request" not in payload and "jules:run" not in labels and not owner_from_labels(labels):
+    elif "pull_request" not in payload and "jules:run" not in labels and not owner_from_labels(labels):
         return "ignored issue: jules:run absent"
-
-    state, _ = parse_route_state(gh.comments(number))
-    sticky_owner = owner_from_labels(labels) or (state.owner if state else None)
-
-    if state:
-        if not config.jules_keys.get(state.owner):
-            raise ValueError(f"missing API key for sticky owner {state.owner}")
-        client = JulesClient(config.jules_keys[state.owner])
-        session = client.get_session(state.session)
-        session_state = str(session.get("state", ""))
-        state.state = session_state
-        state.url = str(session.get("url", state.url))
-
-        if session_state == "AWAITING_USER_FEEDBACK":
-            gh.add_labels(number, ["jules:needs-user"])
-            persist(gh, number, state)
-            return f"{state.session} awaits user feedback"
-
-        if session_state in TERMINAL_STATES:
-            if state.round >= config.max_rounds:
-                gh.add_labels(number, ["jules:needs-user"])
-                persist(gh, number, state)
-                return f"stopped at max Jules rounds ({config.max_rounds})"
-            next_state = create_for_owner(
-                owner=state.owner,
-                config=config,
-                repo_full_name=repo_full_name,
-                branch=branch,
-                title=f"{title} (review round {state.round + 1})",
-                prompt=prompt + "\n\nThis is a follow-up review. Re-check the current branch after the previous Jules round.",
-                round_number=state.round + 1,
-            )
-            persist(gh, number, next_state)
-            return f"created sticky follow-up {next_state.session}"
-
-        # Otherwise continue active session (ACTIVE_STATES or other non-terminal states)
-        client.send_message(state.session, event_message(event_name, payload))
-        persist(gh, number, state)
-        return f"continued active sticky session {state.session}"
-
-    repository_private = None
-    if not sticky_owner and config.home == "auto":
-        repository_private = gh.is_private()
-    owner = sticky_owner or choose_owner(labels, config, repository_private=repository_private)
+    if payload.get("action") == "labeled" and (payload.get("label") or {}).get("name") != "jules:run":
+        return "ignored router bookkeeping label"
+    if obj.get("state") == "closed":
+        return "ignored closed issue or PR"
+    if "pull_request" in payload:
+        head_repo = (obj.get("head") or {}).get("repo") or {}
+        if str(head_repo.get("full_name", repo)).lower() != repo:
+            return "ignored fork PR: head branch is not in the routed source"
+    sender = (payload.get("sender") or {}).get("login", "")
+    if command and (payload.get("comment") or {}).get("user", {}).get("login") != sender:
+        return "ignored command with mismatched author"
+    if gh.can_write(sender) is not True:
+        return "ignored event from actor without repository write permission"
+    comments = gh.comments(number)
+    writers = {sender}
+    for row in comments:
+        login = (row.get("user") or {}).get("login", "")
+        if MARKER_PREFIX in (row.get("body") or "") and login and login not in writers and login != "github-actions[bot]":
+            if gh.can_write(login) is True:
+                writers.add(login)
+    state, comment_id = parse_route_state(comments, repository=repo, number=number, keys=config.jules_keys, trusted_logins=writers)
+    sticky = owner_from_labels(labels)
+    if state and sticky and sticky != state.owner:
+        raise ValueError("owner label disagrees with signed session; reconcile ownership")
+    if command and not state:
+        return "ignored /jules comment because no routed session exists"
+    if not state and sticky:
+        raise ValueError("owner label without verified session; reconcile before creating work")
+    private = gh.is_private() if not state and config.home == "auto" else None
+    owner = state.owner if state else choose_owner(labels, config, private)
+    if owner not in config.allowed_owners:
+        raise ValueError("sticky or selected owner is not permitted; no automatic transfer")
+    if not config.jules_keys.get(owner):
+        raise ValueError(f"missing API key for sticky owner {owner}")
     if config.dry_run:
         return f"dry-run: would route #{number} to Jules {owner}"
+    if not config.serialized:
+        raise ValueError("AGENT_ROUTER_SERIALIZED=true requires a per-repository/issue executor lock")
+    ident = event_id(event_name, payload)
 
+    def save(value: RouteState) -> None:
+        nonlocal comment_id
+        value.repository, value.number = repo, number
+        if comment_id is None:
+            created = gh.add_comment(number, "Preparing authenticated Jules routing state.")
+            if type(created.get("id")) is not int:
+                raise ValueError("state write has no confirmed comment ID; do not create a session")
+            comment_id = created["id"]
+        value.comment_id = comment_id
+        gh.update_comment(comment_id, value.comment(key=config.jules_keys[value.owner]))
+
+    def complete(value: RouteState) -> None:
+        value.pending = ""
+        if ident not in value.events:
+            value.events.append(ident)
+        save(value)  # Always save the external result before derived label updates.
+        persist(gh, number, value)
+
+    if state and state.pending:
+        if state.pending == "create":
+            client = JulesClient(config.jules_keys[state.owner])
+            marker = f"[github-agent-router operation:{state.operation}]"
+            matches = [x for x in client.list_sessions()
+                       if marker in x.get("prompt", "")
+                       and (x.get("sourceContext") or {}).get("source") == state.source]
+            if len(matches) == 1:
+                found = matches[0]
+                state.session = found["name"]
+                state.state = str(found.get("state", ""))
+                state.url = str(found.get("url", ""))
+                state.pending = ""
+                # Record the ORIGINAL operation, not the event which discovered recovery.
+                if state.operation_event not in state.events:
+                    state.events.append(state.operation_event)
+                save(state)
+                persist(gh, number, state)
+                return f"recovered session {state.session}; no creation retried"
+        raise ValueError("pending external operation is uncertain; reconcile it before retrying")
+    if state and ident in state.events:
+        persist(gh, number, state)
+        return "ignored already processed event; repaired labels"
+    if state and len(state.events) >= 256:
+        raise ValueError("event history limit reached; archive/reconcile state before continuing")
+    if state:
+        client = JulesClient(config.jules_keys[state.owner])
+        session = client.get_session(state.session)
+        state.state = str(session.get("state", ""))
+        state.url = str(session.get("url", state.url))
+        if command:
+            if state.state in TERMINAL_STATES or state.state not in ACTIVE_STATES | {"AWAITING_USER_FEEDBACK"}:
+                return "ignored command for terminal or unknown session state"
+        elif state.state in {"AWAITING_USER_FEEDBACK", "AWAITING_PLAN_APPROVAL"}:
+            state.needs_user = True
+            complete(state)
+            return f"{state.session} awaits user feedback"
+        elif state.state not in ACTIVE_STATES | TERMINAL_STATES:
+            state.needs_user = True
+            complete(state)
+            return "stopped on unknown session state; preserved owner and round"
+        elif state.state in TERMINAL_STATES:
+            if state.round >= config.max_rounds:
+                state.needs_user = True
+                complete(state)
+                return f"stopped at max Jules rounds ({config.max_rounds})"
+        if command or state.state in ACTIVE_STATES:
+            state.pending, state.operation = "send", uuid.uuid4().hex
+            state.operation_event = ident
+            save(state)
+            client.send_message(state.session, prompt if command else event_message(event_name, payload))
+            state.needs_user = False
+            complete(state)
+            return f"sent message to {state.session}" if command else f"continued active sticky session {state.session}"
+    title, prompt, branch, _, _ = build_prompt(payload)
+    next_round = state.round + 1 if state else 1
+    repo_owner, repo_name = repo.split("/", 1)
+    client = JulesClient(config.jules_keys[owner])
     try:
-        new_state = create_for_owner(
-            owner=owner,
-            config=config,
-            repo_full_name=repo_full_name,
-            branch=branch,
-            title=title,
-            prompt=prompt,
-            round_number=1,
-        )
+        source = client.find_source(repo_owner, repo_name)
     except (JulesError, LookupError) as exc:
-        # Overflow is allowed only for never-claimed work.
-        overflow_owner = _overflow_owner(config, owner)
-        if sticky_owner or not overflow_owner or overflow_owner == owner or not config.jules_keys.get(overflow_owner):
+        alternate = _overflow_owner(config, owner)
+        if state or not alternate or alternate == owner or alternate not in config.allowed_owners or not config.jules_keys.get(alternate):
             raise
         if isinstance(exc, JulesError) and exc.status != 429:
             raise
-        owner = overflow_owner
-        new_state = create_for_owner(
-            owner=owner,
-            config=config,
-            repo_full_name=repo_full_name,
-            branch=branch,
-            title=title,
-            prompt=prompt,
-            round_number=1,
-        )
-
-    persist(gh, number, new_state)
-    return f"created {new_state.session} on Jules {new_state.owner}"
+        owner = alternate
+        client = JulesClient(config.jules_keys[owner])
+        source = client.find_source(repo_owner, repo_name)
+    new = RouteState(owner, "", round=next_round, repository=repo, number=number,
+                     events=list(state.events) if state else [], pending="create",
+                     operation=uuid.uuid4().hex, source=source, branch=branch, operation_event=ident)
+    save(new)
+    # No blind POST retries or cross-account fallback after this durable reservation.
+    session = client.create_session(source=source, branch=branch, title=title,
+                                    prompt=prompt + f"\n\n[github-agent-router operation:{new.operation}]",
+                                    auto_create_pr=True)
+    new.session, new.state = session["name"], str(session.get("state", ""))
+    new.url = str(session.get("url", ""))
+    complete(new)
+    return f"created sticky follow-up {new.session}" if state else f"created {new.session} on Jules {new.owner}"
 
 
 def load_event() -> tuple[str, dict[str, Any]]:
@@ -338,9 +428,9 @@ def load_event() -> tuple[str, dict[str, Any]]:
 
 
 def check_credentials(config: Config) -> int:
-    """Verify configured Jules API keys and GitHub token."""
-    print("Checking configured credentials...")
-    ok = True
+    """Legacy account-only probe; use CLI check for per-repository readiness."""
+    print("Checking configured Jules accounts (not repository readiness)...")
+    ok = any(config.jules_keys.values())
     for owner in ("a", "b"):
         key = config.jules_keys.get(owner, "")
         if not key:
@@ -349,22 +439,15 @@ def check_credentials(config: Config) -> int:
         try:
             client = JulesClient(key)
             sources = client.list_sources()
-            names = [
-                f"{s.get('githubRepo', {}).get('owner', '')}/{s.get('githubRepo', {}).get('repo', '')}"
-                for s in sources
-                if s.get("githubRepo")
-            ]
-            sample = f" (repos: {', '.join(names[:3])}{'...' if len(names) > 3 else ''})" if names else ""
-            print(f"  [Jules {owner.upper()}] OK - {len(sources)} source(s) accessible{sample}")
+            print(f"  [Jules {owner.upper()}] Authenticated - {len(sources)} source(s); selected repository not checked")
         except Exception as exc:
             print(f"  [Jules {owner.upper()}] Error: {exc}")
             ok = False
 
     if config.github_token:
-        print("  [GitHub] GITHUB_TOKEN is set")
+        print("  [GitHub] Token present; authentication and repository permissions NOT verified")
     else:
         print("  [GitHub] GITHUB_TOKEN is not set")
-        ok = False
     return 0 if ok else 1
 
 
@@ -372,303 +455,46 @@ def setup_repo_labels(config: Config, repo_full_name: str) -> None:
     """Ensure standard router labels exist on the specified repository."""
     if not config.github_token:
         raise ValueError("GITHUB_TOKEN is required to setup labels")
+    if config.dry_run:
+        print(f"dry-run: would reconcile labels on {repo_full_name}")
+        return
     gh = GitHubClient(config.github_token, repo_full_name)
     ensured = gh.setup_labels()
     print(f"Successfully ensured {len(ensured)} labels on {repo_full_name}: {', '.join(ensured)}")
 
 
 def generate_workflow_content(
-    home: str = "auto",
-    overflow: str = "auto",
-    max_rounds: int = 2,
-    auto_review_prs: bool = False,
-    private_home: str = "a",
-    public_home: str = "b",
+    home: str = "auto", overflow: str = "", max_rounds: int = 2,
+    auto_review_prs: bool = False, *, revision: str = "",
 ) -> str:
-    overflow_val = f'"{overflow}"' if overflow else '""'
-    auto_review_val = "true" if auto_review_prs else "false"
-    return f"""name: Jules Router
-
-on:
-  issues:
-    types: [opened, edited, labeled, reopened]
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  issue_comment:
-    types: [created]
-
-concurrency:
-  group: jules-router-${{{{ github.repository }}}}-${{{{ github.event.issue.number || github.event.pull_request.number || github.run_id }}}}
-  cancel-in-progress: false
-
-jobs:
-  jules:
-    uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@main
-    with:
-      home: {home}
-      overflow: {overflow_val}
-      private_home: {private_home}
-      public_home: {public_home}
-      max_rounds: {max_rounds}
-      auto_review_prs: {auto_review_val}
-    secrets:
-      jules_a_api_key: ${{{{ secrets.JULES_A_API_KEY }}}}
-      jules_b_api_key: ${{{{ secrets.JULES_B_API_KEY }}}}
-"""
+    """Compatibility renderer; production provisioning resolves inventory policy first."""
+    from .inventory import RepositoryPolicy
+    from .provisioning import ROUTER_REPOSITORY, render_workflow
+    if home not in {"auto", "a", "b"} or overflow not in {"", "auto", "a", "b"}:
+        raise ValueError("invalid executor selection")
+    allowed = ("a", "b") if home == "auto" or overflow == "auto" else tuple(dict.fromkeys([home] + ([overflow] if overflow else [])))
+    policy = RepositoryPolicy(ROUTER_REPOSITORY, 1, "main", True, "auto", home, overflow, allowed, max_rounds, auto_review_prs, True)
+    return render_workflow(policy, revision)
 
 
 def provision_repo(
-    config: Config,
-    repo_full_name: str,
-    home: str = "auto",
-    overflow: str = "auto",
-    max_rounds: int = 2,
-    auto_review_prs: bool = False,
-    branch: str | None = None,
-    private_home: str = "a",
-    public_home: str = "b",
-) -> None:
-    """Provisions a target repository on GitHub: ensures labels and commits workflow."""
-    if not config.github_token:
-        raise ValueError("GITHUB_TOKEN is required to provision repository")
-    gh = GitHubClient(config.github_token, repo_full_name)
-    print(f"Provisioning {repo_full_name}...")
-    ensured = gh.setup_labels()
-    print(f"  [Labels] Ensured {len(ensured)} labels: {', '.join(ensured)}")
-
-    workflow_content = generate_workflow_content(
-        home,
-        overflow,
-        max_rounds,
-        auto_review_prs,
-        private_home,
-        public_home,
-    )
-    workflow_path = ".github/workflows/jules-router.yml"
-    gh.put_file(
-        path=workflow_path,
-        content=workflow_content,
-        message="ci: add Jules router workflow",
-        branch=branch,
-    )
-    print(f"  [Workflow] Created/updated {workflow_path}")
-
-
-def git_remote_slug(repo_path: str) -> str | None:
-    try:
-        res = subprocess.run(
-            ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        url = res.stdout.strip()
-        m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
-
-
-def scan_workspace_repos(
-    roots: list[str] | None = None,
-    owner_filter: str | None = "johnyoonh",
-) -> list[dict[str, Any]]:
-    """Discovers git repos across workspace roots and assigns routing policy:
-    ~/repos -> private -> home: a, overflow: b
-    ~/chrome, ~/github, ~/obsidian -> public/to-be-public -> home: b, overflow: a
-    """
-    home_dir = os.path.expanduser("~")
-    real_home = "/Users/john" if os.path.isdir("/Users/john") else home_dir
-
-    candidate_roots = roots or [
-        os.path.join(real_home, "repos"),
-        os.path.join(real_home, "chrome"),
-        os.path.join(real_home, "github"),
-        os.path.join(real_home, "obsidian"),
-    ]
-
-    discovered: list[dict[str, Any]] = []
-    for root in candidate_roots:
-        if not os.path.isdir(root):
-            continue
-        root_name = os.path.basename(os.path.abspath(root))
-        default_home, default_overflow = ("a", "b") if root_name == "repos" else ("b", "a")
-
-        try:
-            entries = sorted(os.listdir(root))
-        except OSError:
-            continue
-
-        for entry in entries:
-            path = os.path.join(root, entry)
-            if not os.path.isdir(path) or not os.path.isdir(os.path.join(path, ".git")):
-                continue
-            slug = git_remote_slug(path)
-            if not slug:
-                continue
-            if owner_filter and not slug.lower().startswith(f"{owner_filter.lower()}/"):
-                continue
-
-            discovered.append({
-                "path": path,
-                "name": entry,
-                "root": root_name,
-                "slug": slug,
-                "home": default_home,
-                "overflow": default_overflow,
-            })
-    return discovered
-
-
-def provision_workspace(
-    config: Config,
-    roots: list[str] | None = None,
-    apply: bool = False,
-    set_secrets: bool = False,
-    owner_filter: str | None = "johnyoonh",
-    filter_pattern: str | None = None,
-    write_local: bool = False,
-) -> list[dict[str, Any]]:
-    repos = scan_workspace_repos(roots, owner_filter=owner_filter)
-    if filter_pattern:
-        pat = filter_pattern.lower()
-        repos = [r for r in repos if pat in r["slug"].lower() or pat in r["name"].lower()]
-
-    print(f"Discovered {len(repos)} managed repositories across workspace roots:")
-    print("-" * 88)
-    print(f"{'Root':<10} {'Repository Slug':<36} {'Assigned Jules':<16} {'Action'}")
-    print("-" * 88)
-
-    for item in repos:
-        policy = f"home:{item['home']} (over:{item['overflow']})"
-        action_msg = "WILL PROVISION" if apply else "DRY RUN"
-        print(f"{item['root']:<10} {item['slug']:<36} {policy:<16} {action_msg}")
-
-        if apply:
-            try:
-                if write_local and os.path.isdir(item["path"]):
-                    wf_content = generate_workflow_content(
-                        home=item["home"],
-                        overflow=item["overflow"],
-                        max_rounds=config.max_rounds,
-                        auto_review_prs=config.auto_review_prs,
-                    )
-                    wf_dir = os.path.join(item["path"], ".github", "workflows")
-                    os.makedirs(wf_dir, exist_ok=True)
-                    wf_file = os.path.join(wf_dir, "jules-router.yml")
-                    with open(wf_file, "w", encoding="utf-8") as f:
-                        f.write(wf_content)
-                    print(f"  [Local File] Written to {wf_file}")
-                    if config.github_token:
-                        gh = GitHubClient(config.github_token, item["slug"])
-                        gh.setup_labels()
-                else:
-                    provision_repo(
-                        config=config,
-                        repo_full_name=item["slug"],
-                        home=item["home"],
-                        overflow=item["overflow"],
-                        max_rounds=config.max_rounds,
-                        auto_review_prs=config.auto_review_prs,
-                    )
-
-                if set_secrets:
-                    key_a = config.jules_keys.get("a", "")
-                    key_b = config.jules_keys.get("b", "")
-                    if key_a:
-                        subprocess.run(["gh", "secret", "set", "JULES_A_API_KEY", "-R", item["slug"], "--body", key_a], check=True)
-                    if key_b:
-                        subprocess.run(["gh", "secret", "set", "JULES_B_API_KEY", "-R", item["slug"], "--body", key_b], check=True)
-                    print(f"  [Secrets] Pushed JULES_A/B secrets to {item['slug']}")
-
-            except Exception as exc:
-                print(f"  ERROR provisioning {item['slug']}: {exc}", file=sys.stderr)
-
-    if not apply:
-        print("-" * 88)
-        print("Dry run complete. Run with --apply to push labels and workflows to GitHub.")
-        print("Flags: --apply, --set-secrets (pushes API keys via gh), --local (writes to local checkout), --filter <name>")
-
-    return repos
+    config: Config, repo_full_name: str, home: str = "auto", overflow: str = "",
+    max_rounds: int = 2, auto_review_prs: bool = False, branch: str | None = None,
+    *, revision: str = "",
+) -> dict[str, Any]:
+    from .provisioning import provision_repository
+    if branch is not None:
+        raise ValueError("provisioning chooses a dedicated chatgpt/ PR branch, never a direct target branch")
+    if overflow == "auto":
+        raise ValueError("batch provisioning requires an explicit permitted overflow account")
+    policy = {"schema_version": 1, "defaults": {"home": home, "overflow": overflow, "max_rounds": max_rounds, "auto_review_prs": auto_review_prs}, "repositories": {}}
+    return provision_repository(config, repo_full_name, policy, revision)
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = list(sys.argv[1:] if argv is None else argv)
-    config = Config.from_env()
-
-    if args and args[0] in ("--help", "-h", "help"):
-        print("Usage:")
-        print("  github-agent-router                                Route GitHub event from environment")
-        print("  github-agent-router check                          Verify Jules API keys and GitHub token")
-        print("  github-agent-router setup-labels <repo> [repo2...] Ensure required labels exist on repo(s)")
-        print("  github-agent-router provision <repo> [repo2...]    Ensure labels and install visibility-aware jules-router.yml")
-        print("  github-agent-router provision-workspace [options]  Batch provision repos across ~/repos ~/chrome ~/github ~/obsidian")
-        print("                                                     Options: --apply, --local, --set-secrets, --filter <name>")
-        return
-
-    if args and args[0] == "check":
-        sys.exit(check_credentials(config))
-
-    if args and args[0] == "setup-labels":
-        repos = args[1:]
-        if not repos:
-            repo = os.getenv("GITHUB_REPOSITORY", "")
-            if not repo:
-                print("Usage: github-agent-router setup-labels <owner/repo> [repo2...]", file=sys.stderr)
-                sys.exit(1)
-            repos = [repo]
-        for r in repos:
-            setup_repo_labels(config, r)
-        return
-
-    if args and args[0] == "provision-workspace":
-        apply = "--apply" in args
-        set_secrets = "--set-secrets" in args
-        write_local = "--local" in args
-        filter_val = None
-        for idx, arg in enumerate(args):
-            if arg == "--filter" and idx + 1 < len(args):
-                filter_val = args[idx + 1]
-        provision_workspace(
-            config,
-            apply=apply,
-            set_secrets=set_secrets,
-            write_local=write_local,
-            filter_pattern=filter_val,
-        )
-        return
-
-    if args and args[0] == "provision":
-        repos = args[1:]
-        if not repos:
-            repo = os.getenv("GITHUB_REPOSITORY", "")
-            if not repo:
-                print("Usage: github-agent-router provision <owner/repo> [repo2...]", file=sys.stderr)
-                sys.exit(1)
-            repos = [repo]
-        for r in repos:
-            provision_repo(
-                config,
-                r,
-                home=config.home,
-                overflow=config.overflow or "",
-                max_rounds=config.max_rounds,
-                auto_review_prs=config.auto_review_prs,
-                private_home=config.private_home,
-                public_home=config.public_home,
-            )
-        return
-
-    try:
-        event_name, payload = load_event()
-        print(route(config, event_name, payload))
-    except Exception as exc:
-        print(f"github-agent-router: {exc}", file=sys.stderr)
-        raise
+    from .cli import main as cli_main
+    cli_main(argv)
 
 
 if __name__ == "__main__":
     main()
-
