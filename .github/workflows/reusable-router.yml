@@ -29,6 +29,11 @@ on:
         required: false
         default: false
         type: boolean
+      verification_timeout:
+        description: Maximum seconds to hold the PR verification gate open for Jules
+        required: false
+        default: 1800
+        type: number
     secrets:
       router_read_token:
         description: Read-only access to this private source repository for cross-repository checkout
@@ -77,3 +82,16 @@ jobs:
           JULES_A_API_KEY: ${{ secrets.jules_a_api_key }}
           JULES_B_API_KEY: ${{ secrets.jules_b_api_key }}
         run: github-agent-router
+      - name: Await Jules certification
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AGENT_ROUTER_SERIALIZED: "true"
+          JULES_HOME: ${{ inputs.home }}
+          JULES_OVERFLOW: ${{ inputs.overflow }}
+          JULES_ALLOWED_OWNERS: ${{ inputs.allowed_owners }}
+          JULES_MAX_ROUNDS: ${{ inputs.max_rounds }}
+          JULES_AUTO_REVIEW_PRS: ${{ inputs.auto_review_prs }}
+          JULES_A_API_KEY: ${{ secrets.jules_a_api_key }}
+          JULES_B_API_KEY: ${{ secrets.jules_b_api_key }}
+        run: github-agent-router watch --timeout "${{ inputs.verification_timeout }}" --interval 30
