@@ -61,6 +61,12 @@ for historical context only; its direct-write, floating-ref, and implicit-overfl
 examples are superseded. Generate target workflows through `provision` rather
 than copying the old example.
 
+## Adversarial PR certification
+
+Same-repository `chatgpt/<slug>` PRs can now enter a structured Jules verification gate automatically. Jules is prompted to add missing behavioral tests, red-team relevant failure modes, and emit an explicit `certified`, `changes_required`, `needs_evidence`, or `needs_user` record. Certification is surfaced as `jules:certified`; blocked outcomes create a deduplicated `chatgpt:handoff` issue for a later ChatGPT/local-evidence loop. A bounded watcher makes unresolved verification visible as a failing workflow rather than silently treating Jules completion as approval.
+
+See [the certification/handoff protocol](docs/CERTIFICATION_LOOP.md) and the machine-readable [E2E satisfaction matrix](tests/e2e_satisfaction.json). The router does not itself run git-fleet or ChatGPT OpenCLI; those remain explicit local-consumer boundaries.
+
 ## Development
 
 ```sh
