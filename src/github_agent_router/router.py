@@ -517,9 +517,20 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
         session = client.get_session(state.session)
         state.state = str(session.get("state", ""))
         state.url = str(session.get("url", state.url))
+        terminal_followup = False
         if command:
-            if state.state in TERMINAL_STATES or state.state not in ACTIVE_STATES | {"AWAITING_USER_FEEDBACK"}:
-                return "ignored command for terminal or unknown session state"
+            if state.state in TERMINAL_STATES:
+                terminal_followup = state.verification in {
+                    "changes_required",
+                    "needs_evidence",
+                    "needs_user",
+                    "failed",
+                    "inconclusive",
+                }
+                if not terminal_followup:
+                    return "ignored command for terminal certified/unclassified session"
+            elif state.state not in ACTIVE_STATES | {"AWAITING_USER_FEEDBACK"}:
+                return "ignored command for unknown session state"
         elif event_name == "watch" and state.state in ACTIVE_STATES:
             return f"pending Jules verification: {state.state}"
         elif state.state == "AWAITING_USER_FEEDBACK":
@@ -613,7 +624,7 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
                 state.handoff_issue = ensure_handoff(gh, payload, state, verification)
                 complete(state)
                 return f"verification blocked at max rounds; handoff issue #{state.handoff_issue}"
-        if command or state.state in ACTIVE_STATES:
+        if (command and not terminal_followup) or state.state in ACTIVE_STATES:
             state.pending, state.operation = "send", uuid.uuid4().hex
             state.operation_event = ident
             save(state)
@@ -621,11 +632,31 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
             state.needs_user = False
             complete(state)
             return f"sent message to {state.session}" if command else f"continued active sticky session {state.session}"
-    title, prompt, branch, _, _ = build_prompt(payload)
-    if state and state.state == "COMPLETED":
-        prompt += "\n\nThe previous round completed without a valid verification marker. Re-check the current branch and finish with the required structured verdict."
-    elif state and state.state in {"FAILED", "CANCELLED", "CANCELED"}:
-        prompt += f"\n\nThe previous verification round ended in {state.state}. Re-run only the necessary verification and produce the required structured verdict."
+    if state and command and state.state in TERMINAL_STATES and state.verification in {
+        "changes_required",
+        "needs_evidence",
+        "needs_user",
+        "failed",
+        "inconclusive",
+    }:
+        title = f"Evidence follow-up #{number}"[:120]
+        branch = state.branch or payload["repository"].get("default_branch") or "main"
+        prompt = (
+            "Continue the independent verification of the same source work. "
+            "The previous Jules round is terminal, so this is a new sticky round owned by "
+            f"Jules {state.owner.upper()}.\n\n"
+            "New evidence or decision from the durable handoff:\n"
+            f"{prompt}\n\n"
+            "Re-inspect the current branch, rerun only the checks needed to evaluate this "
+            "new evidence, and finish with the required github-agent-router verification marker. "
+            "Do not certify based solely on the handoff text."
+        )
+    else:
+        title, prompt, branch, _, _ = build_prompt(payload)
+        if state and state.state == "COMPLETED":
+            prompt += "\n\nThe previous round completed without a valid verification marker. Re-check the current branch and finish with the required structured verdict."
+        elif state and state.state in {"FAILED", "CANCELLED", "CANCELED"}:
+            prompt += f"\n\nThe previous verification round ended in {state.state}. Re-run only the necessary verification and produce the required structured verdict."
     next_round = state.round + 1 if state else 1
     repo_owner, repo_name = repo.split("/", 1)
     client = JulesClient(config.jules_keys[owner])
