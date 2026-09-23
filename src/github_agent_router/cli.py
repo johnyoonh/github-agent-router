@@ -18,6 +18,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("route", help="route the GitHub event from the environment")
+    watch = commands.add_parser("watch", help="wait for a routed PR to reach a Jules certification verdict")
+    watch.add_argument("--timeout", type=float, default=1800)
+    watch.add_argument("--interval", type=float, default=30)
     for command in ("plan", "check", "setup-labels", "provision"):
         sub = commands.add_parser(command)
         sub.add_argument("repositories", nargs="*")
@@ -28,10 +31,13 @@ def main(argv: list[str] | None = None) -> None:
             sub.add_argument("--router-ref", required=True, help="reviewed full commit SHA; both workflow and code are pinned")
     args = parser.parse_args(argv)
     config = Config.from_env()
-    if args.command in {None, "route"}:
-        from .router import load_event, route
+    if args.command in {None, "route", "watch"}:
+        from .router import load_event, route, watch_event
         event, payload = load_event()
-        print(route(config, event, payload))
+        if args.command == "watch":
+            print(watch_event(config, event, payload, timeout=args.timeout, interval=args.interval))
+        else:
+            print(route(config, event, payload))
         return
     document = read_policy(args.policy)
     repos = inventory_targets(args.repositories, args.manifest, document)
