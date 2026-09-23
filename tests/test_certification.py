@@ -264,6 +264,31 @@ class CertificationContractTests(unittest.TestCase):
 
     @patch("github_agent_router.router.time.sleep")
     @patch("github_agent_router.router.route")
+    def test_watch_accepts_jules_comment_on_pr(self, routed, sleep):
+        payload = {
+            "action": "created",
+            "sender": {"login": "maintainer"},
+            "repository": {"full_name": "owner/repo", "default_branch": "main"},
+            "issue": {
+                "number": 5,
+                "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/5"},
+                "labels": [{"name": "jules-owner:a"}],
+            },
+            "comment": {
+                "body": "/jules local evidence attached",
+                "user": {"login": "maintainer"},
+            },
+        }
+        routed.return_value = "certified by Jules: evidence accepted"
+
+        result = watch_event(cfg(), "issue_comment", payload, timeout=1, interval=0.1)
+
+        self.assertIn("certified by Jules", result)
+        routed.assert_called_once()
+        sleep.assert_not_called()
+
+    @patch("github_agent_router.router.time.sleep")
+    @patch("github_agent_router.router.route")
     def test_watch_waits_until_certified(self, routed, sleep):
         routed.side_effect = [
             "pending Jules verification: IN_PROGRESS",
