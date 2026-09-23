@@ -50,7 +50,6 @@ jobs:
     concurrency:
       group: jules-router-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: false
-      queue: max
     permissions:
       contents: read
       issues: write
