@@ -22,10 +22,10 @@ MARKER_RE = re.compile(r"<!-- github-agent-router:(\{.*?\}) -->", re.DOTALL)
 ACTIVE_STATES = {"QUEUED", "PLANNING", "AWAITING_PLAN_APPROVAL", "IN_PROGRESS", "PAUSED"}
 TERMINAL_STATES = {"COMPLETED", "FAILED", "CANCELLED", "CANCELED"}
 VERIFICATION_RE = re.compile(
-    r"<!-- github-agent-router:verification:(\\{.*?\\}) -->", re.DOTALL
+    r"<!-- github-agent-router:verification:(\{.*?\}) -->", re.DOTALL
 )
 CHATGPT_ORIGIN_RE = re.compile(
-    r"<!-- chatgpt-opencli:origin:(\\{.*?\\}) -->", re.DOTALL
+    r"<!-- chatgpt-opencli:origin:(\{.*?\}) -->", re.DOTALL
 )
 VERDICTS = {"certified", "changes_required", "needs_evidence", "needs_user"}
 AUTONOMOUS_UNBLOCK_PROMPT = """Before waiting for user feedback, classify what is missing.
@@ -292,7 +292,7 @@ def extract_chatgpt_origin(body: str) -> dict[str, str]:
         return {}
     result: dict[str, str] = {}
     conversation = raw.get("conversation")
-    if isinstance(conversation, str) and re.fullmatch(r"https://chatgpt\\.com/(?:c|share)/[^\\s]+", conversation):
+    if isinstance(conversation, str) and re.fullmatch(r"https://chatgpt\.com/(?:c|share)/[^\s]+", conversation):
         result["conversation"] = conversation
     for key in ("job_id", "project", "agents_sha"):
         value = raw.get(key)
