@@ -310,7 +310,11 @@ def ensure_handoff(
     repo = payload["repository"]["full_name"].lower()
     obj = payload.get("pull_request") or payload.get("issue") or {}
     number = int(obj["number"])
-    kind = "pull request" if "pull_request" in payload else "issue"
+    kind = (
+        "pull request"
+        if "pull_request" in payload or bool((payload.get("issue") or {}).get("pull_request"))
+        else "issue"
+    )
     marker = f"<!-- github-agent-router:handoff:v1 {repo}#{number} -->"
     origin = extract_chatgpt_origin(str(obj.get("body") or ""))
     source_url = (
@@ -694,10 +698,19 @@ def watch_event(
     interval: float = 30,
 ) -> str:
     """Boundedly wait for a routed PR to reach a certified or explicit blocked verdict."""
-    if event_name != "pull_request":
+    if event_name == "pull_request":
+        if not should_route_pr(payload.get("pull_request") or {}, config):
+            return "verification watch not required for an unrouted PR"
+    elif event_name == "issue_comment":
+        issue = payload.get("issue") or {}
+        body = str((payload.get("comment") or {}).get("body", ""))
+        if not issue.get("pull_request") or not re.match(r"^/jules(?:\\s*:\\s*|\\s+|$)", body):
+            return "verification watch not applicable to this comment"
+        labels = label_names(issue)
+        if "jules:run" not in labels and not owner_from_labels(labels):
+            return "verification watch not required for an unrouted PR comment"
+    else:
         return "verification watch not applicable to this event"
-    if not should_route_pr(payload.get("pull_request") or {}, config):
-        return "verification watch not required for an unrouted PR"
     deadline = time.monotonic() + max(0.0, timeout)
     attempt = 0
     while True:
