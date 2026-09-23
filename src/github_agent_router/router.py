@@ -704,7 +704,7 @@ def watch_event(
     elif event_name == "issue_comment":
         issue = payload.get("issue") or {}
         body = str((payload.get("comment") or {}).get("body", ""))
-        if not issue.get("pull_request") or not re.match(r"^/jules(?:\\s*:\\s*|\\s+|$)", body):
+        if not issue.get("pull_request") or not re.match(r"^/jules(?:\s*:\s*|\s+|$)", body):
             return "verification watch not applicable to this comment"
         labels = label_names(issue)
         if "jules:run" not in labels and not owner_from_labels(labels):
