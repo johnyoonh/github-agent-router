@@ -56,6 +56,7 @@ class RouteState:
     verification: str = ""
     handoff_issue: int = 0
     feedback_nudges: int = 0
+    verified_head: str = ""
 
     def comment(self, *, key: str = "") -> str:
         meta = asdict(self)
@@ -185,6 +186,8 @@ def parse_route_state(
                 raise ValueError("invalid handoff issue")
             if type(state.feedback_nudges) is not int or state.feedback_nudges < 0:
                 raise ValueError("invalid feedback nudge count")
+            if state.verified_head and not re.fullmatch(r"[0-9a-f]{40}", state.verified_head):
+                raise ValueError("invalid verified head")
             return state, int(comment["id"])
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ValueError("malformed bot-authored routing state; reconcile before continuing") from exc
@@ -224,14 +227,14 @@ PR description:
 
 Act as an adversarial verification gate, not a style reviewer. Derive concrete behavioral success criteria from the request and changed code. Run the existing relevant tests and static checks, add focused regression or behavioral tests when coverage is missing, and deliberately probe realistic failure modes: edge/error paths, state transitions, concurrency/races, security boundaries, compatibility, and data-loss risks when relevant.
 
-Fix only verified problems and keep fixes/tests scoped. Do not manufacture cleanup. Do not ask for routine confirmation, logs you can derive from the repository, or choices that have a conservative non-destructive answer. If machine-local evidence is truly required, do not wait indefinitely: return needs_evidence with the exact bounded commands/logs required. Use needs_user only for a material product, security, scope, or data-loss decision that cannot be inferred safely.
+Fix only verified problems and keep fixes/tests scoped. Do not manufacture cleanup. If a code fix is needed, let Jules publish its focused child PR against this source branch. The source PR is not certified merely because that child PR exists: return changes_required until the child commits are incorporated into the source branch and the resulting current source head is re-reviewed. Never certify a different or older head. Do not ask for routine confirmation, logs you can derive from the repository, or choices that have a conservative non-destructive answer. If machine-local evidence is truly required, do not wait indefinitely: return needs_evidence with the exact bounded commands/logs required. Use needs_user only for a material product, security, scope, or data-loss decision that cannot be inferred safely.
 
 Your final agent message for every completed review round MUST contain exactly one marker with JSON:
-<!-- github-agent-router:verification:{{"verdict":"certified","summary":"concise evidence summary","tests":["command/result or not_applicable with reason"],"red_team":["adversarial case/result"],"requests":[]}} -->
+<!-- github-agent-router:verification:{{"verdict":"certified","head":"${head_sha}","summary":"concise evidence summary","tests":["command/result or not_applicable with reason"],"red_team":["adversarial case/result"],"requests":[]}} -->
 
 Allowed verdicts are certified, changes_required, needs_evidence, and needs_user.
-- certified: behavioral checks and at least one adversarial/red-team probe passed; no known merge-blocking shortcoming remains.
-- changes_required: a verified defect remains; describe it and any corrective PR/output.
+- certified: the exact source head named in the marker already contains all fixes; behavioral checks and at least one adversarial/red-team probe passed; no known merge-blocking shortcoming remains.
+- changes_required: a verified defect remains in the source head, including when Jules produced a corrective child PR that still must be incorporated; describe it and any corrective PR/output.
 - needs_evidence: only external/local evidence is missing; requests must name the smallest safe evidence needed.
 - needs_user: a material decision is required; requests must contain the exact question.
 
@@ -252,8 +255,10 @@ Implement the requested behavior with the smallest coherent change. Preserve exi
     return title, prompt, default_branch, number, labels
 
 
-def extract_verification(activities: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return the newest structured Jules verification verdict."""
+def extract_verification(
+    activities: list[dict[str, Any]], *, expected_head: str | None = None
+) -> dict[str, Any] | None:
+    """Return the newest structured Jules verdict for the expected source head."""
     for activity in reversed(activities):
         message = str((activity.get("agentMessaged") or {}).get("agentMessage", ""))
         match = VERIFICATION_RE.search(message)
@@ -266,6 +271,13 @@ def extract_verification(activities: list[dict[str, Any]]) -> dict[str, Any] | N
         verdict = value.get("verdict")
         if verdict not in VERDICTS:
             raise ValueError("Jules verification marker has an unknown verdict")
+        head = value.get("head")
+        if head is not None and (
+            not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+        ):
+            raise ValueError("Jules verification marker head must be a full commit SHA")
+        if expected_head and head != expected_head:
+            continue
         if not isinstance(value.get("summary"), str) or not value["summary"].strip():
             raise ValueError("Jules verification marker requires summary")
         for key in ("tests", "red_team", "requests"):
@@ -418,6 +430,12 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
     obj = payload.get("pull_request") or payload.get("issue") or {}
     number = int(obj["number"])
     labels = label_names(obj)
+    current_head = ""
+    if "pull_request" in payload:
+        current_head = str((obj.get("head") or {}).get("sha") or "")
+    elif (payload.get("issue") or {}).get("pull_request"):
+        current_pr = gh.pull_request(number)
+        current_head = str((current_pr.get("head") or {}).get("sha") or "")
     command = event_name == "issue_comment"
     if command:
         message = event_message(event_name, payload)
@@ -490,6 +508,16 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
             value.events.append(ident)
         save(value)  # Always save the external result before derived label updates.
         persist(gh, number, value)
+
+    if state and current_head and state.verified_head and state.verified_head != current_head:
+        state.verification = ""
+        state.verified_head = ""
+        state.handoff_issue = 0
+        state.needs_user = False
+        if state.state in TERMINAL_STATES:
+            state.round = 0
+        save(state)
+        persist(gh, number, state)
 
     if state and state.pending:
         if state.pending == "create":
@@ -588,7 +616,10 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
             verification = None
             if state.state == "COMPLETED":
                 try:
-                    verification = extract_verification(client.list_activities(state.session))
+                    verification = extract_verification(
+                        client.list_activities(state.session),
+                        expected_head=current_head or None,
+                    )
                 except ValueError as exc:
                     verification = {
                         "verdict": "needs_evidence",
@@ -606,8 +637,10 @@ def _route(config: Config, event_name: str, payload: dict[str, Any]) -> str:
                     if state.verification == "certified":
                         state.needs_user = False
                         state.handoff_issue = 0
+                        state.verified_head = current_head
                         complete(state)
                         return f"certified by Jules: {verification['summary']}"
+                    state.verified_head = ""
                     state.needs_user = state.verification == "needs_user"
                     state.handoff_issue = ensure_handoff(gh, payload, state, verification)
                     complete(state)
