@@ -44,7 +44,7 @@ is `COMPLETED`. The newest Jules `agentMessaged.agentMessage` activity must
 contain exactly one marker:
 
 ```text
-<!-- github-agent-router:verification:{"verdict":"certified","summary":"...","tests":["..."],"red_team":["..."],"requests":[]} -->
+<!-- github-agent-router:verification:{"verdict":"certified","head":"<40-char source PR head SHA>","summary":"...","tests":["..."],"red_team":["..."],"requests":[]} -->
 ```
 
 Allowed verdicts:
@@ -56,9 +56,20 @@ Allowed verdicts:
 | `needs_evidence` | The repository alone cannot provide decisive evidence. Exact bounded local evidence is requested. |
 | `needs_user` | A material decision truly requires the user. |
 
-Malformed/missing terminal records never become certification. A missing record
-can trigger another bounded Jules round; after the autonomous cap it becomes an
-inconclusive/blocked handoff.
+Malformed/missing terminal records never become certification. Certification is
+bound to the exact source PR head SHA in the marker. A label from an older head
+is cleared when the source branch advances; the updated head must be reviewed
+again before it can merge.
+
+When Jules finds a code defect, it may create its normal child PR from the source
+PR branch. That child PR is a repair artifact, not a substitute for the source
+PR. The source verdict remains `changes_required` until the child commits are
+incorporated into the source branch. The resulting source head is then routed
+through a fresh Jules verification round. This keeps the original ChatGPT handoff
+PR as the single integration unit while allowing Jules to make incremental fixes.
+
+A missing record can trigger another bounded Jules round; after the autonomous
+cap it becomes an inconclusive/blocked handoff.
 
 The source PR derives these labels:
 
