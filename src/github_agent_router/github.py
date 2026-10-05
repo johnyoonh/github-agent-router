@@ -89,6 +89,9 @@ class GitHubClient:
     def comments(self, number: int) -> list[dict[str, Any]]:
         return self.paginated(f"/repos/{self.repository}/issues/{number}/comments")
 
+    def pull_request(self, number: int) -> dict[str, Any]:
+        return self._request("GET", f"/repos/{self.repository}/pulls/{number}")
+
     def can_write(self, login: str) -> bool:
         if not re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", login):
             return False
