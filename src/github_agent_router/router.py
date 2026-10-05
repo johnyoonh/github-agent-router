@@ -230,7 +230,7 @@ Act as an adversarial verification gate, not a style reviewer. Derive concrete b
 Fix only verified problems and keep fixes/tests scoped. Do not manufacture cleanup. If a code fix is needed, let Jules publish its focused child PR against this source branch. The source PR is not certified merely because that child PR exists: return changes_required until the child commits are incorporated into the source branch and the resulting current source head is re-reviewed. Never certify a different or older head. Do not ask for routine confirmation, logs you can derive from the repository, or choices that have a conservative non-destructive answer. If machine-local evidence is truly required, do not wait indefinitely: return needs_evidence with the exact bounded commands/logs required. Use needs_user only for a material product, security, scope, or data-loss decision that cannot be inferred safely.
 
 Your final agent message for every completed review round MUST contain exactly one marker with JSON:
-<!-- github-agent-router:verification:{{"verdict":"certified","head":"${head_sha}","summary":"concise evidence summary","tests":["command/result or not_applicable with reason"],"red_team":["adversarial case/result"],"requests":[]}} -->
+<!-- github-agent-router:verification:{{"verdict":"certified","head":"{head_sha}","summary":"concise evidence summary","tests":["command/result or not_applicable with reason"],"red_team":["adversarial case/result"],"requests":[]}} -->
 
 Allowed verdicts are certified, changes_required, needs_evidence, and needs_user.
 - certified: the exact source head named in the marker already contains all fixes; behavioral checks and at least one adversarial/red-team probe passed; no known merge-blocking shortcoming remains.
