@@ -35,6 +35,7 @@ def cfg(**kwargs):
 def marker(verdict="certified", **overrides):
     value = {
         "verdict": verdict,
+        "head": "a" * 40,
         "summary": "observed behavior matches the requested contract",
         "tests": ["python -m unittest: pass"],
         "red_team": ["malformed input rejected without mutation"],
@@ -104,6 +105,25 @@ class CertificationContractTests(unittest.TestCase):
                 }
             }])
 
+    def test_verification_is_bound_to_the_exact_source_head(self):
+        activities = [{
+            "agentMessaged": {
+                "agentMessage": marker(head="b" * 40),
+            }
+        }]
+        self.assertIsNone(extract_verification(activities, expected_head="a" * 40))
+        matched = extract_verification(
+            [{"agentMessaged": {"agentMessage": marker()}}],
+            expected_head="a" * 40,
+        )
+        self.assertEqual(matched["head"], "a" * 40)
+
+    def test_review_prompt_requires_jules_repairs_to_rejoin_source_pr(self):
+        _, prompt, _, _, _ = build_prompt(pr_payload())
+        self.assertIn("child PR against this source branch", prompt)
+        self.assertIn("return changes_required until the child commits are incorporated", prompt)
+        self.assertIn('"head":"' + "a" * 40 + '"', prompt)
+
     def test_chatgpt_origin_accepts_only_canonical_conversation(self):
         body = '<!-- chatgpt-opencli:origin:{"conversation":"https://chatgpt.com/c/abc","project":"repo","agents_sha":"1234"} -->'
         self.assertEqual(extract_chatgpt_origin(body)["conversation"], "https://chatgpt.com/c/abc")
@@ -127,6 +147,8 @@ class CertificationContractTests(unittest.TestCase):
         gh.ensure_handoff_issue.assert_not_called()
         gh.add_labels.assert_any_call(5, ["agent:chatgpt", "jules:run"])
         gh.add_labels.assert_any_call(5, ["jules:certified"])
+        signed = gh.update_comment.call_args_list[-1].args[1]
+        self.assertIn('"verified_head":"' + "a" * 40 + '"', signed)
 
     @patch("github_agent_router.router.GitHubClient")
     @patch("github_agent_router.router.JulesClient")
