@@ -5,6 +5,8 @@ Pending is a successful control-plane iteration, never a passing merge gate.
 """
 from __future__ import annotations
 
+import base64
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -65,16 +67,37 @@ def save_state(gh, number, state, keys):
     if type(state["comment_id"]) is not int:
         raise ValueError("state comment ID is not confirmed")
     data = dict(state)
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    if len(payload) > 20000:
+        raise ValueError("canonical state exceeds bounded comment budget; reconcile history")
     data["signature"] = signature(data, keys[state["owner"]])
+    # Sign exact bytes for cross-language consumers; do not reconstruct Python
+    # float/Unicode serialization in a Worker. The original marker stays readable.
+    envelope = {"payload": base64.b64encode(payload).decode(), "signature": data["signature"]}
     gh.update_comment(state["comment_id"], "<!-- github-agent-router:" +
-                      json.dumps(data, separators=(",", ":")) + " -->\n\n" +
+                      json.dumps(data, separators=(",", ":")) + " -->\n" +
+                      "<!-- github-agent-router:envelope:" + json.dumps(envelope, separators=(",", ":")) + " -->\n\n" +
                       f"Jules {state['owner'].upper()}: {state.get('verification') or state.get('state') or 'pending'}\n" +
+                      f"Session: `{state.get('session', '')}`\n" +
                       f"Head: `{state.get('head_sha', 'legacy/unbound')}`; base: `{state.get('base_sha', 'legacy/unbound')}`")
 
 
 def parse_verdict(activities, head, base):
-    # Only the NEWEST agent message may certify. An old marker is not reusable.
-    for activity in reversed(activities):
+    # API pagination order is not evidence of recency. Require and compare the
+    # provider's timestamps; a missing/ambiguous newest message fails closed.
+    messages = [a for a in activities if (a.get("agentMessaged") or {}).get("agentMessage") is not None]
+    def timestamp(activity):
+        try:
+            value = datetime.fromisoformat(activity["createTime"].replace("Z", "+00:00"))
+            if value.tzinfo is None:
+                raise ValueError("timestamp is not timezone-aware")
+            return value
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError("agent message timestamp missing or invalid") from exc
+    messages.sort(key=timestamp, reverse=True)
+    if len(messages) > 1 and timestamp(messages[0]) == timestamp(messages[1]):
+        raise ValueError("newest Jules message is ambiguous")
+    for activity in messages:
         message = (activity.get("agentMessaged") or {}).get("agentMessage")
         if message is None:
             continue
@@ -193,7 +216,8 @@ def probe(config, event, payload, *, gh=None, jules_factory=None, now=None):
         if not unchanged:
             verdict = "stale"
         passed = verdict == "certified" and unchanged
-        gh.add_labels(number, [f"jules-owner:{owner}"])
+        gh.add_labels(number, [f"jules-owner:{owner}", "jules:run"] +
+                      (["agent:chatgpt"] if pr["head"]["ref"].startswith("chatgpt/") else []))
         if passed:
             gh.add_labels(number, ["jules:certified"])
             for label in ("agent:blocked", "jules:changes-required", "jules:needs-user"):
