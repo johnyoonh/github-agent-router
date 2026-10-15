@@ -1,0 +1,22 @@
+name = "jules-cert-sweeper"
+main = "worker.js"
+compatibility_date = "2026-10-15"
+
+# Every 5 minutes. Timing rationale (2026-10-15, from 116 Jules Router PR runs):
+# time-to-terminal p50 16 min, p90 26 min, p95 29 min, p99 46 min, >=25% > 30 min.
+# Fixed 5-min ticks detect 100% of terminals within 5 min (p99 lag = 5.0 min).
+# An exponential-backoff variant (5,10,20,40,80) only reached 54% within
+# 10 min (p99 lag 39.6 min) — backoff trades detection speed for API calls
+# that are already free, so it is deliberately NOT used.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "SESS"
+# Create with: wrangler kv:namespace create SESS
+# Then paste the returned id here.
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# Set to the target repo before deploying.
+GITHUB_REPO = "johnyoonh/hanuri-missions"
