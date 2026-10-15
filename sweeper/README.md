@@ -29,12 +29,35 @@ Python sweeper for the same repository.
 
 ## Rollout
 
-Keep the existing `GITHUB_REPO`, `SESS` namespace and secret bindings. The current
-checked-in namespace ID is a placeholder, not a deployed resource. Supply:
+Configure repository scope, `SESS` KV namespace, and credentials:
 
-- `JULES_API_KEY` for the selected sticky executor (`JULES_OWNER`, default `a`).
-- `GITHUB_TOKEN` with repository metadata, pull-request/issue read access and
-  **Contents: write** for `repository_dispatch`. It does not need rule administration.
+- **Repository Targeting (`wrangler.toml` vars)**:
+  - `ALLOW_REPOS`: Set to `"*"` (or `"all"`) to discover and sweep all active repositories accessible to the token, or provide a comma-separated list (`"org/repo1, org/repo2"`) for granular inclusion.
+  - `DISALLOW_REPOS`: Provide an explicit comma-separated list of repositories to exclude/skip (e.g. `"org/archive-repo, org/private-notes"`).
+  - `GITHUB_REPO`: Supported as single-target fallback.
+
+- **Secrets (`wrangler secret put`)**:
+  - `GITHUB_TOKEN`: Token with repository metadata, pull-request/issue read access, and **Contents: write** for `repository_dispatch`.
+  - `JULES_A_API_KEY`: API key for Jules executor account `a`.
+  - `JULES_B_API_KEY`: API key for Jules executor account `b` (for overflow or multi-account routing).
+  - *(Legacy `JULES_API_KEY` is also supported as fallback).*
+
+### Secret Provisioning via Bitwarden CLI (`bwa`)
+
+```bash
+cd sweeper
+
+# 1. Provision KV namespace (paste returned ID into wrangler.toml)
+npx -y wrangler kv:namespace create SESS
+
+# 2. Pipe secrets directly from Bitwarden without terminal exposure
+bwa get JulesA JULES_A_API_KEY | npx -y wrangler secret put JULES_A_API_KEY
+bwa get JulesB JULES_B_API_KEY | npx -y wrangler secret put JULES_B_API_KEY
+bwa get GithubToken GITHUB_TOKEN_jules-sweep | npx -y wrangler secret put GITHUB_TOKEN
+
+# 3. Deploy
+npx -y wrangler deploy
+```
 
 Never copy secret values into code or chat. Inspect the existing deployment and
 bindings, install the protocol-2 target workflow, run `npm test` in this directory,
@@ -44,3 +67,4 @@ by committing these files. The ordinary app CI `gate` remains independent.
 
 Reference: Cloudflare Workers scheduled handlers, Web Crypto HMAC, and Workers KV
 consistency documentation; GitHub repository-dispatch REST permissions.
+
