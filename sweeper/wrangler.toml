@@ -18,7 +18,18 @@ binding = "SESS"
 id = "REPLACE_WITH_KV_NAMESPACE_ID"
 
 [vars]
-# Set to the target repo before deploying.
+# Fleet repository selection:
+# - Set ALLOW_REPOS = "*" (or "all") to auto-discover all repositories accessible to the token.
+# - Or set ALLOW_REPOS = "owner/repo1, owner/repo2" for granular selection.
+ALLOW_REPOS = "*"
+
+# Explicit disallow list to exclude specific repositories from being swept:
+# E.g. DISALLOW_REPOS = "owner/archive-repo, owner/private-notes"
+DISALLOW_REPOS = ""
+
+# Backwards compatibility fallback (used if ALLOW_REPOS is unset):
 GITHUB_REPO = "johnyoonh/hanuri-missions"
-# Where [CI ALERT] emails go (Resend).
+
+# Where [CI ALERT] failure-watch emails go (Resend).
 ALERT_EMAIL = "johnyoonh@gmail.com"
+
