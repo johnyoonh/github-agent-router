@@ -93,6 +93,29 @@ deploy watermarks to the newest run and only processes new runs — no alert
 storm on history. `dry` mode (exported test option) is fully read-only.
 Covered by `worker.test.js` ("Failure watch tests").
 
+## Daily digest
+
+A second cron trigger (`0 12 * * *`, 08:00 EDT) sends one summary email per
+day instead of per-run pings. The `scheduled` handler routes that cron to
+`sendDigest`, which:
+
+- Lists each fleet repo's runs from the last 24h (`created=>` filter, one
+  API call per repo) and counts them per workflow.
+- Flags sub-minute failures as likely quota/infra, using run duration as a
+  proxy for the failure watch's 60 s jobs check.
+- Lists open failure streaks and the alerts the failure watch sent in the
+  last 24h (from the `fail:` KV keys, via `alerted_code_at` /
+  `alerted_infra_at` timestamps).
+- Sends a heartbeat ("no completed runs") on quiet days, so a missing digest
+  is itself a signal the Worker is down.
+
+Subject: `[CI DIGEST] 2026-10-16 — 58 runs, 4 failed, 1 alert sent`.
+Covered by `worker.test.js` ("Digest tests"). This is the summary channel:
+with the digest plus `[CI ALERT]`s live, GitHub's own per-run failure
+emails can be switched off entirely (GitHub Settings -> Notifications ->
+Actions) — but only *after* the Worker is deployed and the first digest
+arrives, or failures go into a black hole.
+
 ## Gmail filter (silence GitHub's own failure emails)
 
 GitHub's failure emails come from `notifications@github.com` with subjects

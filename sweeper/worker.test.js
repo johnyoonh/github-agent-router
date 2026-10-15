@@ -336,3 +336,142 @@ test("dry run sends nothing and writes nothing", async () => {
   assert.deepEqual(f.posts, []);
   assert.equal(f.store.size(), before);
 });
+
+
+// ---- Digest tests ----
+import { sendDigest } from "./worker.js";
+
+function dgStore() {
+  const m = new Map();
+  return {
+    get: async (k) => { const v = m.get(k); return v === undefined ? null : v; },
+    put: async (k, v) => { m.set(k, JSON.parse(v)); },
+    del: async (k) => { m.delete(k); },
+    size: () => m.size,
+    list: async (o) => {
+      const ks = [];
+      for (const k of m.keys()) if (k.startsWith(o.prefix)) ks.push({ name: k });
+      return { keys: ks, list_complete: true };
+    },
+  };
+}
+
+function dgFixture() {
+  const store = dgStore();
+  const posts = [];
+  const runsDb = [];
+  let seq = 9000;
+  const now = Date.now();
+  const mkRun = (over, durMin) => {
+    const id = ++seq;
+    const start = new Date(now - durMin * 60000).toISOString();
+    const run = {
+      id: id,
+      name: "CI",
+      head_branch: "feat/x",
+      event: "pull_request",
+      status: "completed",
+      conclusion: "success",
+      html_url: "https://example.test/runs/" + id,
+      head_commit: { id: "a1b2c3", message: "test commit" },
+      run_started_at: start,
+      updated_at: new Date(now).toISOString(),
+      created_at: start,
+    };
+    for (const k of Object.keys(over)) run[k] = over[k];
+    runsDb.push(run);
+    return id;
+  };
+  const env = {
+    ALLOW_REPOS: "a/b",
+    GITHUB_TOKEN: "placeholder",
+    ALERT_EMAIL: "alerts@example.test",
+    RESEND_API_KEY: "placeholder",
+    SESS: {
+      get: (k) => store.get(k),
+      put: (k, v) => store.put(k, v),
+      delete: (k) => store.del(k),
+      list: (o) => store.list(o),
+    },
+  };
+  const fetcher = async (url, init) => {
+    const u = String(url);
+    if (u.indexOf("api.resend.com/emails") !== -1) {
+      posts.push(JSON.parse(init.body));
+      return new Response(null, { status: 200 });
+    }
+    if (u.indexOf("/actions/runs?") !== -1) {
+      const sorted = [...runsDb].sort((a, b) => b.id - a.id);
+      return Response.json(sorted);
+    }
+    throw new Error("unexpected URL: " + u);
+  };
+  return { env: env, fetcher: fetcher, posts: posts, store: store, mkRun: mkRun };
+}
+
+test("digest summarizes runs and flags sub-minute failures", async () => {
+  const f = dgFixture();
+  f.mkRun({ conclusion: "success" }, 5);
+  f.mkRun({ conclusion: "success" }, 4);
+  f.mkRun({ conclusion: "failure", name: "CI" }, 6);
+  f.mkRun({ conclusion: "failure", name: "Lint" }, 0.3);
+  f.mkRun({ conclusion: "failure", name: "Lint" }, 0.2);
+  const r = await sendDigest(f.env, { fetcher: f.fetcher });
+  assert.equal(r.runs, 5);
+  assert.equal(r.failed, 3);
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].subject, /\[CI DIGEST\]/);
+  assert.match(f.posts[0].subject, /5 runs, 3 failed/);
+  assert.match(f.posts[0].text, /Lint: 2\/2 failed \(all <1 min/);
+  assert.match(f.posts[0].text, /CI: 1\/3 failed/);
+});
+
+test("digest lists open streaks and recent alerts", async () => {
+  const f = dgFixture();
+  f.mkRun({ conclusion: "failure" }, 6);
+  const st = {
+    code: 3, infra: 0, alerted_code: true, alerted_infra: false,
+    alerted_code_at: Date.now(), seen: Date.now(),
+  };
+  await f.env.SESS.put("fail:a/b#CI#feat/x", JSON.stringify(st));
+  const r = await sendDigest(f.env, { fetcher: f.fetcher });
+  assert.equal(r.alerts, 1);
+  assert.match(f.posts[0].subject, /1 alert sent/);
+  assert.match(f.posts[0].text, /streak CI on feat\/x: 3x code \(alerted\)/);
+});
+
+test("digest with no runs still sends a heartbeat", async () => {
+  const f = dgFixture();
+  const r = await sendDigest(f.env, { fetcher: f.fetcher });
+  assert.equal(r.runs, 0);
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].text, /no completed runs/);
+});
+
+test("digest dry run sends nothing", async () => {
+  const f = dgFixture();
+  f.mkRun({ conclusion: "failure" }, 6);
+  const r = await sendDigest(f.env, { fetcher: f.fetcher, dry: true });
+  assert.equal(r.dry_run, true);
+  assert.deepEqual(f.posts, []);
+});
+
+test("scheduled handler routes the daily cron to the digest", async () => {
+  const f = dgFixture();
+  f.mkRun({ conclusion: "success" }, 2);
+  // scheduled() calls sendDigest(env) with no options, so it reads the
+  // global fetch; swap in the fixture fetcher for the duration of the test.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = f.fetcher;
+  try {
+    const waited = [];
+    const ctx = { waitUntil: (p) => waited.push(p) };
+    const mod = await import("./worker.js");
+    await mod.default.scheduled({ cron: "0 12 * * *" }, f.env, ctx);
+    await Promise.all(waited);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].subject, /\[CI DIGEST\]/);
+});
