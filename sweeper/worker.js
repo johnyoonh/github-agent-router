@@ -8,9 +8,13 @@ const VERDICTS = new Set(["certified", "changes_required", "needs_evidence", "ne
 const encoder = new TextEncoder();
 
 export default {
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(sweep(env));
-    ctx.waitUntil(failureWatch(env));
+  async scheduled(event, env, ctx) {
+    if (event && event.cron === DIGEST_CRON) {
+      ctx.waitUntil(sendDigest(env));
+    } else {
+      ctx.waitUntil(sweep(env));
+      ctx.waitUntil(failureWatch(env));
+    }
   },
   async fetch(request) {
     // No unauthenticated path may spend API calls or create Actions runs.
@@ -298,6 +302,7 @@ async function failureWatchRepo(store, env, repo, gh, request, fetcher, dry, err
         if (!dry) { await sendAlert(env, buildAlert(run, "infra", st, failedJobs), fetcher); sent++; }
         else { sent++; }
         st.alerted_infra = true;
+        st.alerted_infra_at = Date.now();
       }
     } else {
       st.code++;
@@ -306,6 +311,7 @@ async function failureWatchRepo(store, env, repo, gh, request, fetcher, dry, err
         if (!dry) { await sendAlert(env, buildAlert(run, catastrophic ? "main" : "repeated", st, failedJobs), fetcher); sent++; }
         else { sent++; }
         st.alerted_code = true;
+        st.alerted_code_at = Date.now();
       }
     }
     await putState(key, st);
@@ -356,4 +362,94 @@ async function sendAlert(env, alert, fetcher) {
     body: JSON.stringify({ from: "CI Alerts <alerts@hanurimissions.org>", to: [env.ALERT_EMAIL], subject: alert.subject, text: alert.text }),
   });
   if (!res.ok) throw new Error(`Resend returned ${res.status}`);
+}
+
+// Daily digest: one summary email instead of per-run noise. Wired to the
+// second cron trigger ("0 12 * * *", 08:00 EDT). Counts runs in the last 24h
+// per workflow, flags sub-minute failures as likely quota/infra (same 60 s
+// heuristic as the failure watch, via run duration), and lists open streaks
+// plus alerts sent (from the failure-watch KV state).
+const DIGEST_CRON = "0 12 * * *";
+
+export async function sendDigest(env, options = {}) {
+  if (!env.GITHUB_TOKEN || !env.SESS) throw new Error("missing sweeper bindings");
+  const dry = !!options.dry;
+  const store = dry
+    ? { get: (k, t) => env.SESS.get(k, t), put: async () => {}, delete: async () => {},
+        list: (o) => env.SESS.list(o) }
+    : env.SESS;
+  const fetcher = options.fetcher || fetch;
+  const gh = { Authorization: "Bearer " + env.GITHUB_TOKEN, Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "jules-cert-sweeper" };
+  async function request(url, init) {
+    const opts = Object.assign({ redirect: "error", signal: AbortSignal.timeout(15000) }, init);
+    const response = await fetcher(url, opts);
+    if (!response.ok) throw new Error("API returned " + response.status);
+    return response.status === 204 ? null : response.json();
+  }
+  const repoList = await resolveRepos(env, request, gh);
+  const since = Date.now() - 24 * 3600 * 1000;
+  const sinceIso = new Date(since).toISOString();
+  const dateStr = new Date().toISOString().slice(0, 10);
+  let totalRuns = 0, totalFailed = 0, alertsSent = 0;
+  const lines = [];
+  for (const repo of repoList) {
+    let runs;
+    try {
+      runs = await request("https://api.github.com/repos/" + repo + "/actions/runs?per_page=100&created=>" + sinceIso, { headers: gh });
+    } catch (e) {
+      lines.push(repo + ": could not list runs (" + e.message + ")");
+      continue;
+    }
+    const done = runs.filter((r) => r.status === "completed");
+    if (!done.length) {
+      lines.push(repo + ": no completed runs in the last 24h.");
+      continue;
+    }
+    totalRuns += done.length;
+    const byWf = new Map();
+    for (const r of done) {
+      let w = byWf.get(r.name);
+      if (!w) { w = { runs: 0, failed: 0, infra: 0 }; byWf.set(r.name, w); }
+      w.runs++;
+      if (r.conclusion === "failure") {
+        totalFailed++;
+        w.failed++;
+        const startMs = new Date(r.run_started_at || r.created_at).getTime();
+        const durS = (new Date(r.updated_at).getTime() - startMs) / 1000;
+        if (durS < 60) w.infra++;
+      }
+    }
+    let repoFailed = 0;
+    for (const w of byWf.values()) repoFailed += w.failed;
+    lines.push(repo + ": " + done.length + " runs, " + repoFailed + " failed.");
+    const ranked = [...byWf.entries()].sort((a, b) => b[1].failed - a[1].failed);
+    for (const entry of ranked) {
+      const name = entry[0], w = entry[1];
+      if (!w.failed) continue;
+      let note = "";
+      if (w.infra === w.failed) note = " (all <1 min — likely quota/infra)";
+      else if (w.infra) note = " (" + w.infra + " <1 min)";
+      lines.push("  - " + name + ": " + w.failed + "/" + w.runs + " failed" + note);
+    }
+    const prefix = "fail:" + repo + "#";
+    for (const k of await listKeys(store, prefix)) {
+      const st = await store.get(k, "json");
+      if (!st) continue;
+      const rest = k.slice(prefix.length).split("#");
+      const branch = rest.pop();
+      const wf = rest.join("#");
+      const open = [];
+      if (st.code) open.push(st.code + "x code" + (st.alerted_code ? " (alerted)" : ""));
+      if (st.infra) open.push(st.infra + "x infra" + (st.alerted_infra ? " (alerted)" : ""));
+      if (open.length) lines.push("  - streak " + wf + " on " + branch + ": " + open.join(", "));
+      if (st.alerted_code_at && st.alerted_code_at >= since) alertsSent++;
+      if (st.alerted_infra_at && st.alerted_infra_at >= since) alertsSent++;
+    }
+  }
+  const plural = alertsSent === 1 ? "" : "s";
+  const subject = "[CI DIGEST] " + dateStr + " — " + totalRuns + " runs, " + totalFailed + " failed, " + alertsSent + " alert" + plural + " sent";
+  const text = [subject, ""].concat(lines).join("\n");
+  if (!dry) await sendAlert(env, { subject, text }, fetcher);
+  return { repos: repoList.length, runs: totalRuns, failed: totalFailed, alerts: alertsSent, dry_run: dry };
 }
