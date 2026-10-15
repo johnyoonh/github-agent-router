@@ -1,23 +1,19 @@
 name: Reusable Jules Router
-
 on:
   workflow_call:
     inputs:
       router_ref:
-        description: Reviewed full commit SHA; pin this to the same revision as the reusable workflow
+        description: Reviewed full commit SHA, identical to this reusable workflow revision
         required: true
         type: string
       home:
-        description: Primary executor (auto uses private A / public B)
         required: true
         type: string
       overflow:
-        description: Explicit permitted fallback for unclaimed source lookup only
         required: false
         default: ""
         type: string
       allowed_owners:
-        description: Comma-separated accounts permitted for existing and new work
         required: false
         default: "a,b"
         type: string
@@ -30,47 +26,48 @@ on:
         default: false
         type: boolean
       verification_timeout:
-        description: Maximum seconds to hold the PR verification gate open for Jules
+        description: Deprecated compatibility input; probes never sleep or wait
         required: false
-        default: 300
+        default: 0
         type: number
     secrets:
       router_read_token:
-        description: Read-only access to this private source repository for cross-repository checkout
         required: false
       jules_a_api_key:
         required: false
       jules_b_api_key:
         required: false
-
 jobs:
   route:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     concurrency:
-      group: jules-router-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
-      cancel-in-progress: true
+      # Dispatch and normal events MUST acquire the same PR mutation lock.
+      group: jules-router-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.client_payload.pr_number }}
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       issues: write
       pull-requests: write
+      statuses: write
     steps:
       - name: Validate immutable source revision
         env:
           ROUTER_REF: ${{ inputs.router_ref }}
-        run: python3 -c 'import os,re; assert re.fullmatch("[0-9a-f]{40}", os.environ["ROUTER_REF"]), "router_ref must be a full reviewed commit SHA"'
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        run: python3 -c 'import os,re; assert re.fullmatch("[0-9a-f]{40}", os.environ["ROUTER_REF"]), "router_ref must be a full reviewed SHA"'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: johnyoonh/github-agent-router
           ref: ${{ inputs.router_ref }}
           token: ${{ secrets.router_read_token || github.token }}
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
       - run: python -m pip install --no-deps .
-      - name: Route event
+      - name: One authenticated routing or certification iteration
         env:
           GITHUB_TOKEN: ${{ github.token }}
           AGENT_ROUTER_SERIALIZED: "true"
@@ -81,17 +78,4 @@ jobs:
           JULES_AUTO_REVIEW_PRS: ${{ inputs.auto_review_prs }}
           JULES_A_API_KEY: ${{ secrets.jules_a_api_key }}
           JULES_B_API_KEY: ${{ secrets.jules_b_api_key }}
-        run: github-agent-router
-      - name: Await Jules certification
-        if: github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && startsWith(github.event.comment.body, '/jules'))
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          AGENT_ROUTER_SERIALIZED: "true"
-          JULES_HOME: ${{ inputs.home }}
-          JULES_OVERFLOW: ${{ inputs.overflow }}
-          JULES_ALLOWED_OWNERS: ${{ inputs.allowed_owners }}
-          JULES_MAX_ROUNDS: ${{ inputs.max_rounds }}
-          JULES_AUTO_REVIEW_PRS: ${{ inputs.auto_review_prs }}
-          JULES_A_API_KEY: ${{ secrets.jules_a_api_key }}
-          JULES_B_API_KEY: ${{ secrets.jules_b_api_key }}
-        run: github-agent-router watch --timeout "${{ inputs.verification_timeout }}" --interval 30
+        run: github-agent-router probe

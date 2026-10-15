@@ -1,44 +1,56 @@
-"""Batch commands with per-repository results and no implicit fleet activation."""
+"""Batch commands and a one-shot delivery control plane; no implicit activation."""
 from __future__ import annotations
-
 import argparse
 from dataclasses import replace
 import json
 import os
-
+import sys
 from . import __version__
-from .config import Config
-from .github import GitHubClient
-from .inventory import inventory_targets, read_policy, resolve_policy
-from .provisioning import inspect_repository, provision_repository, readiness
 
 
 def main(argv: list[str] | None = None) -> None:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "merge-evaluate":
+        from .merge_control import main as merge_main
+        raise SystemExit(merge_main(raw[1:]))
+    if raw and raw[0] == "sweep":
+        from .sweeper import main as sweep_main
+        raise SystemExit(sweep_main(raw[1:]))
     parser = argparse.ArgumentParser(prog="github-agent-router")
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command")
-    commands.add_parser("route", help="route the GitHub event from the environment")
-    watch = commands.add_parser("watch", help="wait for a routed PR to reach a Jules certification verdict")
-    watch.add_argument("--timeout", type=float, default=1800)
+    commands.add_parser("route", help="route once; PRs use revision-bound certification")
+    commands.add_parser("probe", help="one authenticated event iteration; never waits or sleeps")
+    commands.add_parser("merge-evaluate", help="evaluate signed evidence and native merge authorization")
+    commands.add_parser("sweep", help="one external backoff sweep; no Actions idle polling")
+    watch = commands.add_parser("watch", help="deprecated alias for one-shot PR probes; timeout/interval are ignored")
+    watch.add_argument("--timeout", type=float, default=60)
     watch.add_argument("--interval", type=float, default=30)
     for command in ("plan", "check", "setup-labels", "provision"):
         sub = commands.add_parser(command)
         sub.add_argument("repositories", nargs="*")
-        sub.add_argument("--manifest", help="repository inventory TSV; does not scan the user's machine")
-        sub.add_argument("--policy", help="explicit routing policy JSON")
+        sub.add_argument("--manifest")
+        sub.add_argument("--policy")
         sub.add_argument("--dry-run", action="store_true")
         if command == "provision":
-            sub.add_argument("--router-ref", required=True, help="reviewed full commit SHA; both workflow and code are pinned")
-    args = parser.parse_args(argv)
+            sub.add_argument("--router-ref", required=True, help="reviewed full SHA; workflow and code share one pin")
+    args = parser.parse_args(raw)
+    from .config import Config
+    from .github import GitHubClient
     config = Config.from_env()
-    if args.command in {None, "route", "watch"}:
-        from .router import load_event, route, watch_event
+    if args.command in {None, "route", "probe", "watch"}:
+        from .router import load_event, route
+        from .certification import event_pr, probe
         event, payload = load_event()
-        if args.command == "watch":
-            print(watch_event(config, event, payload, timeout=args.timeout, interval=args.interval))
+        if event_pr(event, payload) is not None:
+            # Includes legacy `watch` invocations: no second string-parsed certification engine.
+            print(json.dumps(probe(config, event, payload), sort_keys=True))
         else:
-            print(route(config, event, payload))
+            print(json.dumps({"execution": "success", "certification": "not_applicable",
+                              "merge_ready": False, "detail": route(config, event, payload)}))
         return
+    from .inventory import inventory_targets, read_policy, resolve_policy
+    from .provisioning import inspect_repository, provision_repository, readiness
     document = read_policy(args.policy)
     repos = inventory_targets(args.repositories, args.manifest, document)
     if not repos:
@@ -75,7 +87,6 @@ def main(argv: list[str] | None = None) -> None:
                     result = {"repository": policy.repository, "status": "labels_reconciled", "labels": gh.setup_labels()}
             results.append(result)
         except Exception as exc:
-            # Continue independent targets; failures never become a successful batch.
             results.append({"repository": repository, "status": "blocked", "error": str(exc)})
     print(json.dumps({"schema_version": 1, "version": __version__, "results": results}, indent=2))
     if any(x["status"] == "blocked" for x in results):
