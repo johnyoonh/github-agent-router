@@ -82,7 +82,7 @@ test("multi-account sweep authenticates and dispatches for both Jules A and Jule
   const storage = new Map();
   const env = {
     GITHUB_REPO: "a/b",
-    GITHUB_TOKEN: "token",
+    GITHUB_TOKEN: "ghp_testvalue123",
     JULES_A_API_KEY: "key-a",
     JULES_B_API_KEY: "key-b",
     SESS: { async get(k) { return storage.get(k); }, async put(k, v) { storage.set(k, JSON.parse(v)); } },
@@ -137,7 +137,7 @@ test("allow list and disallow list filter repositories with granular choices", a
   const env = {
     ALLOW_REPOS: "org/repo1, org/repo2, org/repo3",
     DISALLOW_REPOS: "org/repo2",
-    GITHUB_TOKEN: "token",
+    GITHUB_TOKEN: "ghp_testvalue123",
     JULES_API_KEY: "key",
     SESS: { async get() { return null; }, async put() {} },
   };
@@ -159,7 +159,7 @@ test("wildcard allow list auto-discovers repos and applies disallow exclusion", 
   const env = {
     ALLOW_REPOS: "*",
     DISALLOW_REPOS: "user/excluded",
-    GITHUB_TOKEN: "token",
+    GITHUB_TOKEN: "ghp_testvalue123",
     JULES_API_KEY: "key",
     SESS: { async get() { return null; }, async put() {} },
   };
@@ -186,3 +186,153 @@ test("wildcard allow list auto-discovers repos and applies disallow exclusion", 
   assert.ok(!checked.some(u => u.includes("user/archived")));
 });
 
+// ---- Failure watch tests ----
+import { failureWatch } from "./worker.js";
+
+function fwStorage() {
+  const m = new Map();
+  return {
+    async get(k) { const v = m.get(k); return v === undefined ? null : v; },
+    async put(k, v) { m.set(k, JSON.parse(v)); },
+    async del(k) { m.delete(k); },
+    size() { return m.size; },
+    async list(o) {
+      const ks = [];
+      for (const k of m.keys()) if (k.startsWith(o.prefix)) ks.push({ name: k });
+      return { keys: ks, list_complete: true };
+    },
+  };
+}
+
+function fwFixture() {
+  const store = fwStorage();
+  const posts = [];
+  const runsDb = [];
+  const jobsDb = {};
+  let seq = 5000;
+  const now = Date.now();
+  const mkJob = (minutes, conclusion) => [{
+    name: "build",
+    conclusion,
+    started_at: new Date(now - minutes * 60000).toISOString(),
+    completed_at: new Date(now).toISOString(),
+  }];
+  const mkRun = (over, minutes) => {
+    const id = ++seq;
+    const run = {
+      id, name: "CI", head_branch: "feat/x", event: "pull_request",
+      status: "completed", conclusion: "failure",
+      html_url: "https://example.test/runs/" + id,
+      head_commit: { id: "a1b2c3", message: "test commit" },
+    };
+    Object.assign(run, over);
+    runsDb.push(run);
+    const jc = run.conclusion === "success" ? "success" : "failure";
+    jobsDb[id] = mkJob(minutes, jc);
+    return id;
+  };
+  const env = {
+    ALLOW_REPOS: "a/b",
+    GITHUB_TOKEN: "placeholder",
+    ALERT_EMAIL: "alerts@example.test",
+    RESEND_API_KEY: "placeholder",
+    SESS: {
+      get: (k) => store.get(k),
+      put: (k, v) => store.put(k, v),
+      delete: (k) => store.del(k),
+      list: (o) => store.list(o),
+    },
+  };
+  const fetcher = async (url, init) => {
+    const u = String(url);
+    if (u.indexOf("api.resend.com/emails") !== -1) {
+      posts.push(JSON.parse(init.body));
+      return new Response(null, { status: 200 });
+    }
+    if (u.indexOf("/actions/runs?") !== -1) {
+      const sorted = [...runsDb].sort((a, b) => b.id - a.id);
+      return Response.json(sorted);
+    }
+    const jm = u.match(/\/actions\/runs\/(\d+)\/jobs/);
+    if (jm) return Response.json({ jobs: jobsDb[jm[1]] || [] });
+    throw new Error("unexpected URL: " + u);
+  };
+  return { env, fetcher, posts, store, mkRun };
+}
+
+test("fresh deploy watermarks without alerting on history", async () => {
+  const f = fwFixture();
+  f.mkRun({}, 5); f.mkRun({}, 5); f.mkRun({}, 5); f.mkRun({}, 5);
+  const r = await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(r.alerts, 0);
+  assert.deepEqual(f.posts, []);
+});
+
+test("three consecutive code failures alert exactly once", async () => {
+  const f = fwFixture();
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({}, 5);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(f.posts.length, 0);
+  f.mkRun({}, 5); f.mkRun({}, 5);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].subject, /failed 3x in a row/);
+  f.mkRun({}, 5);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(f.posts.length, 1);
+});
+
+test("a success resets the failure streak", async () => {
+  const f = fwFixture();
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({}, 5); f.mkRun({}, 5);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({ conclusion: "success" }, 5);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({}, 5);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(f.posts.length, 0);
+});
+
+test("code failure on a main push alerts immediately", async () => {
+  const f = fwFixture();
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({ head_branch: "main", event: "push" }, 8);
+  const r = await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(r.alerts, 1);
+  assert.match(f.posts[0].subject, /FAILED on main push/);
+});
+
+test("ten sub-minute deaths alert once with the infra hint", async () => {
+  const f = fwFixture();
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  for (let i = 0; i < 9; i++) f.mkRun({ name: "Lint", head_branch: "feat/y" }, 0.2);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(f.posts.length, 0);
+  f.mkRun({ name: "Lint", head_branch: "feat/y" }, 0.2);
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(f.posts.length, 1);
+  assert.match(f.posts[0].subject, /dying in <60s/);
+  assert.match(f.posts[0].text, /quota/);
+});
+
+test("cancelled runs are ignored", async () => {
+  const f = fwFixture();
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({ conclusion: "cancelled" }, 0);
+  const r = await failureWatch(f.env, { fetcher: f.fetcher });
+  assert.equal(r.alerts, 0);
+  assert.deepEqual(f.posts, []);
+});
+
+test("dry run sends nothing and writes nothing", async () => {
+  const f = fwFixture();
+  await failureWatch(f.env, { fetcher: f.fetcher });
+  f.mkRun({}, 5); f.mkRun({}, 5); f.mkRun({}, 5);
+  const before = f.store.size();
+  const r = await failureWatch(f.env, { fetcher: f.fetcher, dry: true });
+  assert.equal(r.alerts, 1);
+  assert.deepEqual(f.posts, []);
+  assert.equal(f.store.size(), before);
+});
