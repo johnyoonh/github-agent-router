@@ -32,7 +32,7 @@ on:
       verification_timeout:
         description: Maximum seconds to hold the PR verification gate open for Jules
         required: false
-        default: 1800
+        default: 300
         type: number
     secrets:
       router_read_token:
@@ -47,9 +47,10 @@ jobs:
   route:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: jules-router-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
-      cancel-in-progress: false
+      cancel-in-progress: true
     permissions:
       contents: read
       issues: write

@@ -2,9 +2,9 @@ name: Jules Router
 
 on:
   issues:
-    types: [opened, edited, labeled, reopened]
+    types: [opened, reopened]
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
 
