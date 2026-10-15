@@ -1,23 +1,30 @@
+# Managed by github-agent-router; schema=1
+# Delivery protocol=2: one-shot probes; no polling on paid runners.
 name: Jules Router
-
 on:
   issues:
     types: [opened, reopened]
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
-
+  repository_dispatch:
+    types: [jules-cert-sweep]
 permissions:
   contents: read
   issues: write
   pull-requests: write
-
+  statuses: write
 jobs:
   jules:
-    uses: ./.github/workflows/reusable-router.yml
+    # Filter comments before allocating a runner, including our own state comments.
+    if: >-
+      (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/jules')) &&
+      !startsWith(github.event.issue.title || '', '[App feedback]') &&
+      !startsWith(github.event.issue.title || '', '[App report]')
+    uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@09278292df911a6914fdfbf9a97fd055e741cd88
     with:
-      router_ref: ${{ github.workflow_sha }}
+      router_ref: 09278292df911a6914fdfbf9a97fd055e741cd88
       home: auto
       overflow: ""
       allowed_owners: "a,b"

@@ -1,66 +1,18 @@
 """Idempotent label/workflow provisioning through a dedicated pull request."""
 from __future__ import annotations
-
 from dataclasses import asdict
 import base64
 import hashlib
-import re
 from typing import Any
 from urllib.parse import quote
-
 from .config import Config
 from .github import GitHubClient, GitHubError
 from .inventory import RepositoryPolicy, resolve_policy
 from .jules import JulesClient
+from .workflow import MANAGED, ROUTER_REPOSITORY, render_workflow
 
-
-ROUTER_REPOSITORY = "johnyoonh/github-agent-router"
 WORKFLOW_PATH = ".github/workflows/jules-router.yml"
-MANAGED = "# Managed by github-agent-router; schema=1"
 PR_MARKER = "<!-- github-agent-router:provision:v1 -->"
-
-
-def render_workflow(policy: RepositoryPolicy, revision: str) -> str:
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("router revision must be a full, reviewed commit SHA")
-    if not policy.private:
-        raise ValueError("public target cannot call the private router; approve a public-safe distribution first")
-    secrets = [f"      jules_{x}_api_key: ${{{{ secrets.JULES_{x.upper()}_API_KEY }}}}" for x in policy.allowed_owners]
-    if policy.repository != ROUTER_REPOSITORY:
-        secrets.append("      router_read_token: ${{ secrets.ROUTER_READ_TOKEN }}")
-    return f'''{MANAGED}
-name: Jules Router
-
-on:
-  # 2026-10-15: narrowed after agent-speed labeling/edit loops burned a full
-  # month of Actions minutes in one night. Triage only needs opened/reopened
-  # (+ synchronize for PR pushes, + issue_comment for explicit /jules commands);
-  # `edited`/`labeled` re-fired routing in a self-reinforcing loop.
-  issues:
-    types: [opened, reopened]
-  pull_request:
-    types: [opened, synchronize, reopened]
-  issue_comment:
-    types: [created]
-
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
-
-jobs:
-  jules:
-    uses: {ROUTER_REPOSITORY}/.github/workflows/reusable-router.yml@{revision}
-    with:
-      router_ref: {revision}
-      home: {policy.home}
-      overflow: "{policy.overflow}"
-      allowed_owners: "{','.join(policy.allowed_owners)}"
-      max_rounds: {policy.max_rounds}
-      auto_review_prs: {str(policy.auto_review_prs).lower()}
-      verification_timeout: 300
-    secrets:
-''' + "\n".join(secrets) + "\n"
 
 
 def decode_file(value: dict[str, Any] | None) -> str | None:
@@ -92,8 +44,7 @@ def readiness(gh: GitHubClient, config: Config, policy: RepositoryPolicy) -> Non
         raise ValueError("secret metadata pagination limit exceeded")
     if required - names:
         raise ValueError("missing Actions secret metadata: " + ", ".join(sorted(required - names)))
-    # Secret values are not readable. This cannot prove that the stored values equal
-    # the locally tested credentials or that the checkout token is valid.
+    # Stored secret values and reusable-workflow authorization still need a live smoke test.
 
 
 def inspect_repository(config: Config, repository: str, document: dict[str, Any]) -> dict[str, Any]:
@@ -157,7 +108,6 @@ def provision_repository(config: Config, repository: str, document: dict[str, An
                 ref = gh._request("GET", ref_path)
             else:
                 ref = {"object": {"sha": base_sha}}
-        # Resume only an empty branch or exactly the workflow-only change we planned.
         if ref["object"]["sha"] != base_sha:
             comparison = gh._request("GET", f"/repos/{policy.repository}/compare/{base}...{quote(branch, safe='')}")
             if comparison.get("behind_by", 0) or not comparison.get("files") or any(x["filename"] != WORKFLOW_PATH for x in comparison["files"]):
@@ -171,7 +121,6 @@ def provision_repository(config: Config, repository: str, document: dict[str, An
     if decode_file(gh.get_file(WORKFLOW_PATH, ref=branch)) != content:
         raise ValueError("workflow readback did not match the planned content")
     if not pr:
-        # Re-read after writes, including recovery from an earlier uncertain PR POST.
         matching = gh.paginated(f"/repos/{policy.repository}/pulls?state=open&head={quote(gh.owner + ':' + branch, safe='')}&base={base}")
         if len(matching) > 1:
             raise ValueError("duplicate branch PRs")

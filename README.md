@@ -1,81 +1,73 @@
 # GitHub Agent Router
 
-Sticky GitHub-to-Jules routing with authenticated state and inventory-driven,
-PR-based repository provisioning. Requires Python 3.11+; no runtime dependencies.
+Sticky GitHub-to-Jules routing with authenticated state, one-shot PR certification,
+and revision-bound native merge decisions. Python 3.11+; no runtime dependencies.
 
-## Routing policy
+## Delivery boundary
 
-Private repositories are A-primary; public repositories are B-primary. A private
-repository intended for publication needs an explicit `to-be-public` policy or
-`home: b` override. Root directories never establish publication intent.
-Overflow is disabled by default. Permitted existing ownership stays sticky;
-policy conflicts stop rather than silently transferring a session.
+ChatGPT/Codex produce a `chatgpt/` source PR. Jules independently checks the exact
+source head and current base and returns behavioral/adversarial evidence. Any
+repair PR is integrated back into the original source PR by git-fleet after a
+combined-candidate test; the resulting source head is recertified.
 
-The shared inventory and policy are maintained in `johnyoonh/dotfiles`:
-`repos/repos-manifest.tsv` and `repos/agent-routing.json`.
+`git-fleet verify-pr` supplies a signed receipt for the actual proposed merge tree.
+The router checks that receipt, the signed Jules verdict, current GitHub required
+checks, reviews, protection and revisions. Only the native PR merge endpoint is
+used. A 403/404 is a permission/resource failure, never a signal to rewrite main
+with the Git Data API. Merging and production/device validation remain separate.
 
 ## Commands
 
 ```sh
 github-agent-router --version
-github-agent-router plan OWNER/REPO
-github-agent-router check OWNER/REPO
-github-agent-router setup-labels OWNER/REPO --dry-run
-github-agent-router setup-labels OWNER/REPO
-github-agent-router provision OWNER/REPO --router-ref REVIEWED_FULL_COMMIT_SHA --dry-run
-github-agent-router provision OWNER/REPO --router-ref REVIEWED_FULL_COMMIT_SHA
+github-agent-router plan OWNER/REPO --policy /trusted/agent-routing.json
+github-agent-router check OWNER/REPO --policy /trusted/agent-routing.json
+github-agent-router provision OWNER/REPO --policy /trusted/agent-routing.json --router-ref REVIEWED_FULL_SHA --dry-run
+github-agent-router probe
+github-agent-router sweep OWNER/REPO --state /trusted/router-sweep.json --dry-run
+github-agent-router merge-evaluate OWNER/REPO --pr 12 --receipt /evidence/pr12.json --policy /trusted/delivery-policy.json
 ```
 
-Batch commands accept `--manifest` and `--policy`, deduplicate repositories, and
-report per-target JSON results. Failures do not stop independent targets but do
-produce a nonzero batch exit. No command requires `gh`.
+`probe` processes one authenticated event and exits. It does not sleep while Jules
+works. An iteration can succeed while certification is **pending** or **blocked**;
+its execution result is not a merge gate. The separate `agent-certification`
+commit status remains pending/failed until the matching revision is certified.
+The existing repository `gate` check is never fabricated or replaced.
 
-Provisioning reconciles the five standard labels and opens/reuses a scoped
-`chatgpt/` PR against the actual default branch. It preserves unmanaged files and
-unrelated changes. Both the reusable workflow and executed source are pinned to
-one reviewed full SHA. Provisioning does not merge, change repository visibility,
-copy secrets, or enable unattended schedules.
+The `watch` command is now a deprecated compatibility alias for one-shot PR
+processing; timeout/interval are accepted but ignored. New callers must use
+`probe`. Do not use successful workflow completion as Jules certification.
 
-## Security and migration
+## Security and coordination
 
-The runtime authorizes event actors, binds HMAC-authenticated state to its original
-comment and repository/issue, rejects fork-head confusion, and enforces read-only
-dry runs. Serialized execution and durable pending operations prevent blind
-retries after uncertain external writes. State is saved before labels, so a label
-failure can be repaired without repeating session creation or messaging.
+Per-PR queued serialization covers normal events and external sweep dispatches.
+Active mutations are not cancelled; signed pending-operation reservations make
+uncertain external writes recoverable without blind retries. Sweeps use the
+actual authenticated event sender and live PR state, never a fabricated owner.
+Bookkeeping comments are filtered before runner allocation. An external bounded
+sweeper stores backoff and dispatch reservations rather than parking an Actions
+runner for polling.
 
-**Unsigned legacy state and key rotation require reconciliation.** They halt
-rather than create duplicate work. Existing callers must supply `router_ref` and
-provide serialization. The included reusable workflow supplies per-issue queued
-serialization and never cancels active runs.
+Private repositories default to account A, public repositories to B. Existing
+permitted ownership remains sticky. PR certification does not silently transfer
+accounts or use overflow after an external operation. Legacy issue routing keeps
+its existing policy behavior. Inventory planning/provisioning still uses explicit
+repository selection and `repos/agent-routing.json`; credentials are never copied
+into PRs or repository files.
 
-**Public workflow activation remains gated.** A public repository cannot call this
-private reusable workflow. Planning and labels are supported; activation requires
-an explicitly approved public-safe distribution or central dispatcher. Private
-cross-repository callers need reusable-workflow access and `ROUTER_READ_TOKEN`.
-Credential metadata is not proof that stored secret values are valid.
-
-Read [operations, credentials, recovery, and validation](docs/OPERATIONS.md) before
-migrating existing callers. [The original 0.1 README](docs/LEGACY-0.1.md) is retained
-for historical context only; its direct-write, floating-ref, and implicit-overflow
-examples are superseded. Generate target workflows through `provision` rather
-than copying the old example.
-
-## Adversarial PR certification
-
-Same-repository `chatgpt/<slug>` PRs can now enter a structured Jules verification gate automatically. Jules is prompted to add missing behavioral tests, red-team relevant failure modes, and emit an explicit `certified`, `changes_required`, `needs_evidence`, or `needs_user` record. Certification is surfaced as `jules:certified`; blocked outcomes create a deduplicated `chatgpt:handoff` issue for a later ChatGPT/local-evidence loop. A bounded watcher makes unresolved verification visible as a failing workflow rather than silently treating Jules completion as approval.
-
-See [the certification/handoff protocol](docs/CERTIFICATION_LOOP.md) and the machine-readable [E2E satisfaction matrix](tests/e2e_satisfaction.json). The router does not itself run git-fleet or ChatGPT OpenCLI; those remain explicit local-consumer boundaries.
+Read [operations and migration](docs/OPERATIONS.md), the
+[certification protocol](docs/CERTIFICATION_LOOP.md), and
+[merge policy, exceptions and runner rollout](docs/DELIVERY.md).
 
 ## Development
 
 ```sh
 python -m pip install .
-python -m unittest discover -s tests -p 'test_*.py'
+python -m unittest discover -s tests -p 'test_*.py' -v
 python -W error -m compileall -q src tests
 ```
 
-Tests use synthetic, stateful service doubles; they are not live GitHub/Jules
-integration evidence. Deployment needs credential-backed target smoke tests.
-Full SHA-bound merge evaluation, scheduled status/drift reconciliation, automatic
-legacy-state migration, and public runtime distribution remain separate work.
+Synthetic API tests are not live Jules/GitHub or device evidence. Roll out a
+reviewed immutable runtime pin and perform credentialed target smoke tests before
+requiring `agent-certification` in a ruleset. Never silently weaken protection,
+turn an unavailable check green, or declare a production deployment from unit tests.

@@ -1,10 +1,35 @@
-# Historical copy-and-paste workflows are intentionally retired in 0.2.
-# Generate a complete, policy-specific workflow with both references pinned:
-#
-# github-agent-router provision OWNER/REPO --policy POLICY_JSON \
-#   --router-ref REVIEWED_FULL_COMMIT_SHA --dry-run
-#
-# Then rerun without --dry-run after credentials and source access are verified.
-# The provisioner opens/reuses a chatgpt/ PR; it does not write the default branch.
-# Public targets require an approved public-safe distribution before activation.
-# See docs/OPERATIONS.md. This comment-only file is not an installable workflow.
+# Managed by github-agent-router; schema=1
+# Delivery protocol=2: one-shot probes; no polling on paid runners.
+name: Jules Router
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  repository_dispatch:
+    types: [jules-cert-sweep]
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+jobs:
+  jules:
+    # Filter comments before allocating a runner, including our own state comments.
+    if: >-
+      (github.event_name != 'issue_comment' || startsWith(github.event.comment.body, '/jules')) &&
+      !startsWith(github.event.issue.title || '', '[App feedback]') &&
+      !startsWith(github.event.issue.title || '', '[App report]')
+    uses: johnyoonh/github-agent-router/.github/workflows/reusable-router.yml@09278292df911a6914fdfbf9a97fd055e741cd88
+    with:
+      router_ref: 09278292df911a6914fdfbf9a97fd055e741cd88
+      home: a
+      overflow: ""
+      allowed_owners: "a"
+      max_rounds: 2
+      auto_review_prs: true
+    secrets:
+      jules_a_api_key: ${{ secrets.JULES_A_API_KEY }}
+      router_read_token: ${{ secrets.ROUTER_READ_TOKEN }}
