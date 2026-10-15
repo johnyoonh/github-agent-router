@@ -45,6 +45,17 @@ class SweepTests(unittest.TestCase):
         with patch('github_agent_router.sweeper.read_state', return_value=self.state):
             return sweep(self.api, {'a': 'key'}, self.factory, self.checkpoint,
                          now=1000, **kwargs)
+    def test_settled_current_revision_does_not_poll_or_dispatch(self):
+        self.state["verification"] = "certified"
+        self.assertEqual(self.run_sweep()[0]["status"], "settled")
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.api.writes, [])
+
+    def test_settled_but_changed_base_is_reconsidered(self):
+        self.state["verification"] = "certified"
+        self.state["base_sha"] = "d" * 40
+        self.assertEqual(self.run_sweep()[0]["status"], "dispatched")
+
     def test_pending_has_backoff_no_dispatch(self):
         self.status = 'IN_PROGRESS'
         self.assertEqual(self.run_sweep()[0]['status'], 'pending')

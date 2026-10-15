@@ -68,7 +68,7 @@ class ProbeTests(unittest.TestCase):
         value = {"verdict": "certified", "summary": "verified", "head_sha": head or "a" * 40,
                  "base_sha": base or "b" * 40, "merge_tree_sha": "c" * 40,
                  "tests": ["tests passed"], "red_team": ["race checked"], "requests": []}
-        self.jules.activities = [{"agentMessaged": {"agentMessage":
+        self.jules.activities = [{"createTime": "2026-10-15T12:00:00Z", "agentMessaged": {"agentMessage":
             "<!-- github-agent-router:verification:" + json.dumps(value) + " -->"}}]
     def test_one_shot_pending_not_green(self):
         result = self.run_probe()
@@ -78,6 +78,19 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(self.gh.statuses[-1]["state"], "pending")
         self.assertEqual(self.jules.created, 1)
         self.assertEqual(self.jules.gets, 0)
+    def test_signed_envelope_has_exact_hmac_bytes_and_legacy_session_display(self):
+        import base64, hashlib, hmac, re
+        self.run_probe(now=1000.0)
+        body = self.gh.records[0]["body"]
+        envelope = json.loads(re.search(r"<!-- github-agent-router:envelope:(.*) -->", body).group(1))
+        data = base64.b64decode(envelope["payload"])
+        key = hmac.new(b"key", b"github-agent-router/state/v1", hashlib.sha256).digest()
+        self.assertEqual(hmac.new(key, data, hashlib.sha256).hexdigest(), envelope["signature"])
+        self.assertEqual(json.loads(data)["session"], "sessions/1")
+        self.assertIn("Session: `sessions/1`", body)
+        self.assertIn({"name": "jules:run"}, self.gh.pr["labels"])
+        self.assertIn({"name": "agent:chatgpt"}, self.gh.pr["labels"])
+
     def test_current_revision_certifies(self):
         self.run_probe(); self.certify()
         result = self.run_probe(now=1100)
@@ -130,8 +143,19 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(self.jules.created, 0)
     def test_newest_message_must_have_exactly_one_marker(self):
         self.run_probe(); self.certify()
-        self.jules.activities.append({"agentMessaged": {"agentMessage": "Actually, unresolved failure"}})
+        self.jules.activities.append({"createTime": "2026-10-15T12:01:00Z", "agentMessaged": {"agentMessage": "Actually, unresolved failure"}})
         with self.assertRaises(ValueError): parse_verdict(self.jules.activities, "a" * 40, "b" * 40)
+    def test_activity_order_cannot_replay_an_old_certificate(self):
+        self.run_probe(); self.certify()
+        self.jules.activities.insert(0, {"createTime": "2026-10-15T12:01:00Z",
+            "agentMessaged": {"agentMessage": "Newer blocking defect"}})
+        with self.assertRaises(ValueError): parse_verdict(self.jules.activities, "a" * 40, "b" * 40)
+
+    def test_missing_provider_timestamp_cannot_certify(self):
+        self.run_probe(); self.certify()
+        self.jules.activities[0].pop("createTime")
+        with self.assertRaises(ValueError): parse_verdict(self.jules.activities, "a" * 40, "b" * 40)
+
     def test_tampered_state_never_starts_replacement(self):
         self.run_probe()
         self.gh.records[0]["body"] = self.gh.records[0]["body"].replace("IN_PROGRESS", "COMPLETED")

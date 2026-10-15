@@ -40,9 +40,17 @@ def sweep(gh, keys, factory, checkpoint, *, now, budget=5, dry_run=False):
         state = read_state(gh, number, keys)
         if not state:
             continue
+        current = (state.get("head_sha") == pr["head"]["sha"] and
+                   state.get("base_sha") == pr["base"]["sha"])
+        if current and state.get("verification") in {
+                "certified", "changes_required", "needs_evidence", "needs_user"}:
+            results.append({"pr": number, "status": "settled"})
+            continue
         identity = f"{gh.repository}#{number}"
         entry = checkpoint.get(identity, {})
-        fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(
+            {"state": state, "head_sha": pr["head"]["sha"], "base_sha": pr["base"]["sha"]},
+            sort_keys=True).encode()).hexdigest()
         if entry.get("reserved_fingerprint") == fingerprint:
             results.append({"pr": number, "status": "dispatch_reserved_or_uncertain"})
             continue
