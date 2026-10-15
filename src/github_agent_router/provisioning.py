@@ -32,10 +32,14 @@ def render_workflow(policy: RepositoryPolicy, revision: str) -> str:
 name: Jules Router
 
 on:
+  # 2026-10-15: narrowed after agent-speed labeling/edit loops burned a full
+  # month of Actions minutes in one night. Triage only needs opened/reopened
+  # (+ synchronize for PR pushes, + issue_comment for explicit /jules commands);
+  # `edited`/`labeled` re-fired routing in a self-reinforcing loop.
   issues:
-    types: [opened, edited, labeled, reopened]
+    types: [opened, reopened]
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
 
@@ -54,7 +58,7 @@ jobs:
       allowed_owners: "{','.join(policy.allowed_owners)}"
       max_rounds: {policy.max_rounds}
       auto_review_prs: {str(policy.auto_review_prs).lower()}
-      verification_timeout: 1800
+      verification_timeout: 300
     secrets:
 ''' + "\n".join(secrets) + "\n"
 
